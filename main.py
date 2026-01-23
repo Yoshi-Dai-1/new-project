@@ -1,4 +1,5 @@
 import os
+import sys
 import pandas as pd
 from datetime import datetime
 from tqdm import tqdm
@@ -6,10 +7,13 @@ from time import sleep
 from dotenv import load_dotenv
 from pathlib import Path
 
+# サブモジュールフォルダをPythonの検索パスに追加
+sys.path.append(os.path.join(os.path.dirname(__file__), 'edinet_xbrl_prep'))
+
 # edinet_xbrl_prep から必要なクラスと関数をインポート
-from edinet_xbrl_prep.edinet_api import request_term, request_doc, edinet_response_metadata
-from edinet_xbrl_prep.link_base_file_analyzer import account_list_common
-from edinet_xbrl_prep.fs_tbl import get_fs_tbl
+from edinet_api import request_term, request_doc, edinet_response_metadata
+from link_base_file_analyzer import account_list_common
+from fs_tbl import get_fs_tbl
 
 # 環境変数の読み込み
 load_dotenv()
