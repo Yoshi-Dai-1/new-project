@@ -39,6 +39,11 @@ jobs:
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
-          git add "./data/**/*.db"
-          git commit -m "chore: Daily update of financial DB ($(date +'%Y-%m-%d'))" || echo "No changes to commit"
-          git push
+          # DBファイルが存在する場合のみAddし、存在しない場合はスキップ
+          if [ "$(find ./data -name "*.db" | wc -l)" -gt 0 ]; then
+            git add "./data/**/*.db"
+            git commit -m "chore: Daily update of financial DB ($(date +'%Y-%m-%d'))" || echo "No changes to commit"
+            git push
+          else
+            echo "No DB files to commit."
+          fi

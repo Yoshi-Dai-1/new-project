@@ -132,6 +132,9 @@ def main():
 
     for docid, row in tqdm(yuho_filtered.iterrows(), total=len(yuho_filtered)):
         try:
+            # 【重要】docid を確実に文字列にする（Pydantic Validation Error 回避）
+            docid_str = str(docid)
+            
             submit_year = row['submitYear']
             sector_label = row.get('sector_label_33', 'その他')
             db_path = get_db_path(submit_year, sector_label)
@@ -140,40 +143,40 @@ def main():
             if current_db_path and db_path != current_db_path:
                 save_sector_batch_to_db(current_db_path, sector_batch)
                 sector_batch = []
-                processed_docids = set() # キャッシュクリア
+                processed_docids = set()
 
             current_db_path = db_path
 
-            # 重複判定の高速化（そのDB内の済リストを一回だけ取得）
+            # 重複判定
             if not processed_docids and db_path.exists():
                 conn_check = sqlite3.connect(db_path)
                 cursor = conn_check.cursor()
                 cursor.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='documents'")
                 if cursor.fetchone():
                     cursor.execute('SELECT docID FROM documents')
-                    processed_docids = {r[0] for r in cursor.fetchall()}
+                    processed_docids = {str(r[0]) for r in cursor.fetchall()}
                 conn_check.close()
             
-            if docid in processed_docids:
+            if docid_str in processed_docids:
                 continue
 
             # ダウンロードと解析
-            zip_path = RAW_XBRL_DIR / f"{docid}.zip"
+            zip_path = RAW_XBRL_DIR / f"{docid_str}.zip"
             if not zip_path.exists():
-                request_doc(api_key=API_KEY, docid=docid, out_filename_str=str(zip_path))
+                request_doc(api_key=API_KEY, docid=docid_str, out_filename_str=str(zip_path))
                 sleep(0.1)
             
-            extract_dir = RAW_XBRL_EXT_DIR / docid
+            extract_dir = RAW_XBRL_EXT_DIR / docid_str
             fs_df = get_fs_tbl(
                 account_list_common_obj=account_list,
-                docid=docid,
+                docid=docid_str,
                 zip_file_str=str(zip_path),
                 temp_path_str=str(extract_dir),
                 role_keyward_list=ALL_ROLES
             )
             
             doc_meta = {
-                'docID': docid, 'secCode': row.get('secCode'), 'filerName': row.get('filerName'),
+                'docID': docid_str, 'secCode': row.get('secCode'), 'filerName': row.get('filerName'),
                 'submitDateTime': str(row['submitDateTime']), 'docDescription': row.get('docDescription'),
                 'periodStart': row.get('periodStart'), 'periodEnd': row.get('periodEnd')
             }
