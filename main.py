@@ -76,6 +76,10 @@ if yuho_filtered.empty:
     print("対象の有価証券報告書が見つかりませんでした。")
     exit(0)
 
+# 【高速化・効率化】年度と業種でソート（同じDBへの書き込みを連続させるため）
+yuho_filtered['submitYear'] = yuho_filtered['submitDateTime'].str[:4]
+yuho_filtered = yuho_filtered.sort_values(['submitYear', 'sector_label_33'])
+
 # docIDをインデックスにセット（重複排除のため）
 yuho_filtered = yuho_filtered.set_index("docID")
 print(f"対象書類数: {len(yuho_filtered)}")
@@ -100,6 +104,9 @@ def init_db(conn):
     DBの初期化（テーブル作成）
     """
     cursor = conn.cursor()
+    # 書き込み速度向上のための設定
+    cursor.execute('PRAGMA synchronous = OFF')
+    cursor.execute('PRAGMA journal_mode = WAL')
     
     # 書類管理テーブル
     cursor.execute('''
@@ -172,9 +179,6 @@ def save_to_db(conn, doc_meta, fs_df):
     ))
     
     # 2. financial_dataテーブルへのUPSERT
-    # pandasのto_sqlはUPSERT標準対応していないため、一度一時テーブルに入れるか、executemanyで処理する
-    # ここではレコード単位での細かい制御のため、executemany + INSERT OR REPLACE を使用
-    
     data_to_insert = []
     for _, row in fs_df.iterrows():
         # 必要なカラムを抽出してリスト化
@@ -204,8 +208,11 @@ def save_to_db(conn, doc_meta, fs_df):
     
     conn.commit()
 
-
 print("データ抽出を開始します...")
+
+# 【高速化】DB接続を管理する変数をループの外側に配置
+current_db_path = None
+conn = None
 
 # 処理ループ
 for docid, row in tqdm(yuho_filtered.iterrows(), total=len(yuho_filtered)):
@@ -215,14 +222,19 @@ for docid, row in tqdm(yuho_filtered.iterrows(), total=len(yuho_filtered)):
         submit_year = submit_date[:4] if submit_date else "unknown"
         sector_label = row.get('sector_label_33', 'その他')
         
-        # DB接続
+        # DB接続管理
         db_path = get_db_path(submit_year, sector_label)
-        conn = sqlite3.connect(db_path)
-        init_db(conn)
+        
+        # DBパスが変わったときだけ接続を切り替える
+        if db_path != current_db_path:
+            if conn:
+                conn.close()
+            current_db_path = db_path
+            conn = sqlite3.connect(db_path)
+            init_db(conn)
         
         # 重複チェック（既に処理済みならスキップ）
         if is_doc_processed(conn, docid):
-            conn.close()
             continue
 
         # ダウンロード
@@ -256,11 +268,8 @@ for docid, row in tqdm(yuho_filtered.iterrows(), total=len(yuho_filtered)):
             
             # 保存実行
             save_to_db(conn, doc_meta, fs_tbl)
-            print(f"Saved: {docid} ({row.get('filerName')}) -> {db_path.name}")
             
         finally:
-            conn.close()
-            
             # クリーンアップ：一時ファイルの削除
             # ZIPファイル
             if zip_path.exists():
@@ -271,7 +280,10 @@ for docid, row in tqdm(yuho_filtered.iterrows(), total=len(yuho_filtered)):
 
     except Exception as e:
         print(f"エラー (docID: {docid}): {e}")
-        # エラー発生時もDB接続が開いていれば閉じる（上記finallyでカバー）
         continue
+
+# 最後に接続を確実に閉じる
+if conn:
+    conn.close()
 
 print("全ての処理が完了しました。")
