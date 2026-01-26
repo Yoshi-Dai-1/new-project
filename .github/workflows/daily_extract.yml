@@ -123,25 +123,34 @@ jobs:
           MAX_RETRIES=10
           RETRY_COUNT=0
           while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-            # 解析済みファイルを一時避難させてプル(rebase)を実行
+            echo "Attempt $((RETRY_COUNT+1)): Updating local repository..."
+            # 最新を取得。--autostash で解析済みの未コミットファイルを一時退避してマージ
             if git pull --rebase --autostash origin main; then
-              if [ "$(find ./data -name "*.db" | wc -l)" -gt 0 ]; then
-                git add "./data/**/*.db"
+              echo "Checking for new database files in data/ ..."
+              if [ -d "data" ] && [ "$(find data -name "*.db" | wc -l)" -gt 0 ]; then
+                # gitignore を無視して全ての .db ファイルを強制的にステージング
+                find data -name "*.db" -exec git add -f {} +
+                
                 if git diff --staged --quiet; then
-                  echo "No changes to commit"
+                  echo "No new changes detected (files might be identical)."
                   break
                 fi
+                
                 git commit -m "chore: Extract chunk ${{ matrix.chunk.idx }} (${{ matrix.chunk.count }} docs)"
                 if git push origin main; then
-                  echo "Push successful"
+                  echo "Successfully pushed data to main branch."
                   break
                 fi
               else
-                echo "No files to commit"
+                echo "No .db files found in data/ to commit."
                 break
               fi
+            else
+              echo "Git pull failed, retrying..."
             fi
+            
             RETRY_COUNT=$((RETRY_COUNT+1))
-            echo "Retry $RETRY_COUNT/$MAX_RETRIES..."
-            sleep $((RANDOM % 20 + 10))
+            WAIT_TIME=$((RANDOM % 20 + 10))
+            echo "Collision detected or push failed. Waiting ${WAIT_TIME}s before retry $RETRY_COUNT/$MAX_RETRIES..."
+            sleep $WAIT_TIME
           done
