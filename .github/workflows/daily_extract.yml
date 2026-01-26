@@ -36,23 +36,25 @@ jobs:
           EXTRACT_END: ${{ github.event.inputs.end_date || '2024-06-30' }}
           DISABLE_PANDERA_IMPORT_WARNING: True
         run: |
-          # Python 側で不要なログを stderr に逃がすようにしたため、stdout は純粋な JSON のみとなる
-          DATA=$(python main.py --list-only --start "$EXTRACT_START" --end "$EXTRACT_END")
+          # マーカー（JSON_MATRIX_DATA:）を目印に、ライブラリのログを排除して JSON のみを取得
+          RAW_JSON=$(python main.py --list-only --start "$EXTRACT_START" --end "$EXTRACT_END" | grep "^JSON_MATRIX_DATA:" | cut -d':' -f2-)
+          DATA=${RAW_JSON:-"[]"}
+          
           # 業種（DBファイル）の衝突を防ぎつつ、件数を均等にするロジック
           MATRIX=$(python -c "
           import json, math, sys
           try:
               data = json.loads(sys.argv[1])
-              if not data: print('[]'); exit()
+              if not data:
+                  print('[]')
+                  sys.exit(0)
               
-              # 業種ごとのIDリストを作成
               sec_map = {}
               for item in data:
                   s = item['sector']
                   if s not in sec_map: sec_map[s] = []
                   sec_map[s].append(item['id'])
               
-              # 業種を件数が多い順にソート（大きいものから箱に入れる）
               sorted_sectors = sorted(sec_map.keys(), key=lambda x: len(sec_map[x]), reverse=True)
               
               n = 4
@@ -60,17 +62,16 @@ jobs:
               bucket_counts = [0] * n
               
               for s in sorted_sectors:
-                  # 最も空いているバケットに入れる (Greedy)
                   idx = bucket_counts.index(min(bucket_counts))
                   buckets[idx].extend(sec_map[s])
                   bucket_counts[idx] += len(sec_map[s])
               
-              res = []
-              for i, b in enumerate(buckets):
-                  if b: res.append({'ids': ','.join(b), 'idx': i, 'count': len(b)})
+              res = [{'ids': ','.join(b), 'idx': i, 'count': len(b)} for i, b in enumerate(buckets) if b]
               print(json.dumps(res))
           except Exception as e:
-              print(json.dumps([]))
+              sys.stderr.write(f'Error generating matrix: {e}\\n')
+              sys.stderr.write(f'Input snippet: {sys.argv[1][:100]}\\n')
+              print('[]')
           " "$DATA")
           echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
 

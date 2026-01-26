@@ -198,7 +198,7 @@ def main():
     
     if raw_df.empty:
         if args.list_only:
-            sys.__stdout__.write("[]\n")
+            sys.__stdout__.write("JSON_MATRIX_DATA:[]\n")
         else:
             sys.stderr.write("書類が見つかりませんでした。\n")
         return
@@ -208,7 +208,7 @@ def main():
     
     if yuho_filtered.empty:
         if args.list_only:
-            sys.__stdout__.write("[]\n")
+            sys.__stdout__.write("JSON_MATRIX_DATA:[]\n")
         else:
             sys.stderr.write("対象書類（有報）がありません。\n")
         return
@@ -217,10 +217,10 @@ def main():
     yuho_filtered['submitYear'] = yuho_filtered['submitDateTime'].str[:4]
     yuho_filtered = yuho_filtered.sort_values(['submitYear', 'sector_label_33'])
 
-    # リスト出力モード（ sys.__stdout__ に JSON のみを出す）
+    # リスト出力モード（マーカーをつけて出力）
     if args.list_only:
         id_sector_list = [{"id": str(idx), "sector": str(row['sector_label_33'])} for idx, row in yuho_filtered.iterrows()]
-        sys.__stdout__.write(json.dumps(id_sector_list) + "\n")
+        sys.__stdout__.write("JSON_MATRIX_DATA:" + json.dumps(id_sector_list) + "\n")
         return
 
     # ID指定モード
