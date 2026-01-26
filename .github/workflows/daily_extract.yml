@@ -67,10 +67,28 @@ jobs:
                   bucket_counts[idx] += len(sec_map[s])
               
               res = [{'ids': ','.join(b), 'idx': i, 'count': len(b)} for i, b in enumerate(buckets) if b]
+              
+              # --- 視認性向上のためのレポート出力 (stderr) ---
+              sys.stderr.write(f"\n{'#'*60}\n")
+              sys.stderr.write(f"  EDINET 書類取得・ジョブ分割 レポート\n")
+              sys.stderr.write(f"{'#'*60}\n")
+              sys.stderr.write(f"対象期間内の書類総数: {len(data)} 件\n")
+              
+              if not res:
+                  sys.stderr.write(f"\n[注目] 対象書類が 0 件のため、解析ジョブは作成されません。\n")
+                  sys.stderr.write(f"指定期間（START/END）に提出書類があるか確認してください。\n")
+              else:
+                  sys.stderr.write(f"分割ジョブ数: {len(res)}\n\n")
+                  for r in res:
+                      sys.stderr.write(f"  - Job {r['idx']}: {r['count']} 件の書類を担当\n")
+              
+              sys.stderr.write(f"{'#'*60}\n\n")
+              # ----------------------------------------------
+
               print(json.dumps(res))
           except Exception as e:
               sys.stderr.write(f'Error generating matrix: {e}\\n')
-              sys.stderr.write(f'Input snippet: {sys.argv[1][:100]}\\n')
+              sys.stderr.write(f'Input snippet: {sys.argv[1][:300]}\\n')
               print('[]')
           " "$DATA")
           echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
