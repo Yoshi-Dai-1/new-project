@@ -245,7 +245,7 @@ def main():
     with ProcessPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
         for i in range(0, len(tasks_to_parse), BATCH_PARALLEL_SIZE):
             if is_shutting_down: break
-            batch_tasks = tasks_to_parse[i:i+BATCH_PARALLE_SIZE]
+            batch_tasks = tasks_to_parse[i:i+BATCH_PARALLEL_SIZE]
             
             for docid_str, row_info in batch_tasks:
                 zip_path = RAW_XBRL_DIR / f"{docid_str}.zip"
