@@ -1,0 +1,19 @@
+# Python 一時ファイル
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+
+# EDINET データ関連（巨大なため、ローカルからのプログラミングによるプッシュを防止）
+data/
+*.db
+*.log
+*.zip
+data/raw/
+data/20*/
+
+# 環境設定
+.env
