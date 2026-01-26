@@ -206,15 +206,19 @@ def main():
     yuho_filtered['submitYear'] = yuho_filtered['submitDateTime'].str[:4]
     yuho_filtered = yuho_filtered.sort_values(['submitYear', 'sector_label_33'])
 
-    # リスト出力モード
+    # リスト出力モード（業種情報を含めて出力するように強化）
     if args.list_only:
-        print(json.dumps(yuho_filtered.index.tolist()))
+        # {docID: sector} のリストを返す
+        id_sector_list = [{"id": str(idx), "sector": str(row['sector_label_33'])} for idx, row in yuho_filtered.iterrows()]
+        print(json.dumps(id_sector_list))
         return
 
     # ID指定モード
     if args.id_list:
         target_ids = args.id_list.split(",")
-        yuho_filtered = yuho_filtered.loc[yuho_filtered.index.intersection(target_ids)]
+        # 存在するIDのみに絞り込む
+        valid_ids = yuho_filtered.index.intersection(target_ids)
+        yuho_filtered = yuho_filtered.loc[valid_ids]
 
     print(f"対象書類数: {len(yuho_filtered)}")
     print("共通タクソノミ準備中...")

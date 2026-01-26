@@ -35,19 +35,41 @@ jobs:
           EXTRACT_START: ${{ github.event.inputs.start_date || '2024-06-01' }}
           EXTRACT_END: ${{ github.event.inputs.end_date || '2024-06-30' }}
         run: |
-          IDS=$(python main.py --list-only --start "$EXTRACT_START" --end "$EXTRACT_END")
-          # Matrix分割用スクリプト
+          DATA=$(python main.py --list-only --start "$EXTRACT_START" --end "$EXTRACT_END")
+          # 業種（DBファイル）の衝突を防ぎつつ、件数を均等にするロジック
           MATRIX=$(python -c "
           import json, math, sys
           try:
-              ids = json.loads(sys.argv[1])
+              data = json.loads(sys.argv[1])
+              if not data: print('[]'); exit()
+              
+              # 業種ごとのIDリストを作成
+              sec_map = {}
+              for item in data:
+                  s = item['sector']
+                  if s not in sec_map: sec_map[s] = []
+                  sec_map[s].append(item['id'])
+              
+              # 業種を件数が多い順にソート（大きいものから箱に入れる）
+              sorted_sectors = sorted(sec_map.keys(), key=lambda x: len(sec_map[x]), reverse=True)
+              
               n = 4
-              size = math.ceil(len(ids) / n) if len(ids) > 0 else 0
-              chunks = [ids[i:i + size] for i in range(0, len(ids), size)] if size > 0 else []
-              print(json.dumps([{'ids': ','.join(c), 'idx': i} for i, c in enumerate(chunks)]))
+              buckets = [[] for _ in range(n)]
+              bucket_counts = [0] * n
+              
+              for s in sorted_sectors:
+                  # 最も空いているバケットに入れる (Greedy)
+                  idx = bucket_counts.index(min(bucket_counts))
+                  buckets[idx].extend(sec_map[s])
+                  bucket_counts[idx] += len(sec_map[s])
+              
+              res = []
+              for i, b in enumerate(buckets):
+                  if b: res.append({'ids': ','.join(b), 'idx': i, 'count': len(b)})
+              print(json.dumps(res))
           except Exception as e:
               print(json.dumps([]))
-          " "$IDS")
+          " "$DATA")
           echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
 
   extract:
@@ -89,18 +111,25 @@ jobs:
           MAX_RETRIES=10
           RETRY_COUNT=0
           while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-            git pull --rebase origin main
-            if [ "$(find ./data -name "*.db" | wc -l)" -gt 0 ]; then
-              git add "./data/**/*.db"
-              git commit -m "chore: Extract chunk ${{ matrix.chunk.idx }}" || exit 0
-              if git push origin main; then
-                echo "Push successful"
+            # 解析済みファイルを一時避難させてプル(rebase)を実行
+            if git pull --rebase --autostash origin main; then
+              if [ "$(find ./data -name "*.db" | wc -l)" -gt 0 ]; then
+                git add "./data/**/*.db"
+                if git diff --staged --quiet; then
+                  echo "No changes to commit"
+                  break
+                fi
+                git commit -m "chore: Extract chunk ${{ matrix.chunk.idx }} (${{ matrix.chunk.count }} docs)"
+                if git push origin main; then
+                  echo "Push successful"
+                  break
+                fi
+              else
+                echo "No files to commit"
                 break
               fi
-            else
-              echo "No files to commit"
-              break
             fi
             RETRY_COUNT=$((RETRY_COUNT+1))
+            echo "Retry $RETRY_COUNT/$MAX_RETRIES..."
             sleep $((RANDOM % 20 + 10))
           done
