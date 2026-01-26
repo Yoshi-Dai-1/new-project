@@ -34,8 +34,10 @@ jobs:
           EDINET_API_KEY: ${{ secrets.EDINET_API_KEY }}
           EXTRACT_START: ${{ github.event.inputs.start_date || '2024-06-01' }}
           EXTRACT_END: ${{ github.event.inputs.end_date || '2024-06-30' }}
+          DISABLE_PANDERA_IMPORT_WARNING: True
         run: |
-          DATA=$(python main.py --list-only --start "$EXTRACT_START" --end "$EXTRACT_END")
+          # 警告や進捗バーが stdout に混ざっても、最後の1行（JSON）だけを抽出して確実に取得
+          DATA=$(python main.py --list-only --start "$EXTRACT_START" --end "$EXTRACT_END" | tail -n 1)
           # 業種（DBファイル）の衝突を防ぎつつ、件数を均等にするロジック
           MATRIX=$(python -c "
           import json, math, sys

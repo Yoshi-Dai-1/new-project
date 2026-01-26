@@ -184,6 +184,7 @@ def main():
     start_date = get_last_day_of_month(args.start)
     end_date = get_last_day_of_month(args.end)
 
+    # list-only モード時は tqdm や print を抑制するために stderr を活用するか出力を工夫する
     if not args.list_only:
         print(f"[{start_date} 〜 {end_date}] 抽出ミッション開始")
         
@@ -193,24 +194,31 @@ def main():
     raw_df = edinet_meta.get_metadata_pandas_df()
     
     if raw_df.empty:
-        if not args.list_only: print("書類が見つかりませんでした。")
+        if args.list_only:
+            print("[]")
+        else:
+            print("書類が見つかりませんでした。")
         return
 
     yuho_df = edinet_meta.get_yuho_df()
     yuho_filtered = yuho_df[yuho_df['docTypeCode'] == '120'].copy()
+    
     if yuho_filtered.empty:
-        if not args.list_only: print("対象書類がありません。")
+        if args.list_only:
+            print("[]")
+        else:
+            print("対象書類（有報）がありません。")
         return
 
     if "docID" in yuho_filtered.columns: yuho_filtered.set_index("docID", inplace=True)
     yuho_filtered['submitYear'] = yuho_filtered['submitDateTime'].str[:4]
     yuho_filtered = yuho_filtered.sort_values(['submitYear', 'sector_label_33'])
 
-    # リスト出力モード（業種情報を含めて出力するように強化）
+    # リスト出力モード（ stdout には JSON のみを出す）
     if args.list_only:
-        # {docID: sector} のリストを返す
         id_sector_list = [{"id": str(idx), "sector": str(row['sector_label_33'])} for idx, row in yuho_filtered.iterrows()]
-        print(json.dumps(id_sector_list))
+        # stdoutに確実にJSONだけを出すため、明示的に書き込む
+        sys.stdout.write(json.dumps(id_sector_list) + "\n")
         return
 
     # ID指定モード
