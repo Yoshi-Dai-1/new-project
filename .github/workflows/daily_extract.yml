@@ -1,23 +1,39 @@
-name: Daily EDINET Data Extraction
+name: Daily EDINET Extract
 
 on:
   schedule:
-    # 毎日午前9時 (UTC 0:00)
-    - cron: '0 0 * * *'
-  workflow_dispatch: # 手動実行用
+    - cron: '0 15 * * *'  # 毎日日本時間 0:00 (UTC 15:00)
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: 'Start Date (YYYY-MM-DD)'
+        required: true
+        default: '2024-06-01'
+      end_date:
+        description: 'End Date (YYYY-MM-DD)'
+        required: true
+        default: '2024-06-30'
 
 jobs:
   extract:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1ヶ月を週単位に分割して4並列で実行
+        period: [
+          {start: "01", end: "07"},
+          {start: "08", end: "14"},
+          {start: "15", end: "21"},
+          {start: "22", end: "31"}
+        ]
+    timeout-minutes: 360 # 6時間
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          submodules: true
-          fetch-depth: 0
+          submodules: 'recursive'
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -30,20 +46,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run extraction script
+      - name: Run Extraction
         env:
           EDINET_API_KEY: ${{ secrets.EDINET_API_KEY }}
+          # Matrixから日付を生成
+          EXTRACT_START: "2024-06-${{ matrix.period.start }}"
+          EXTRACT_END: "2024-06-${{ matrix.period.end }}"
         run: python main.py
 
-      - name: Commit and push changes
+      - name: Commit and Push DB
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
-          # DBファイルが存在する場合のみAddし、存在しない場合はスキップ
+          # 他の並列ジョブとの衝突を避けるため、最新を取得してリベース
+          git pull --rebase origin main
           if [ "$(find ./data -name "*.db" | wc -l)" -gt 0 ]; then
             git add "./data/**/*.db"
-            git commit -m "chore: Daily update of financial DB ($(date +'%Y-%m-%d'))" || echo "No changes to commit"
-            git push
-          else
-            echo "No DB files to commit."
+            git commit -m "chore: Extract data for ${{ matrix.period.start }}-${{ matrix.period.end }}" || echo "No changes"
+            git push origin main
           fi
