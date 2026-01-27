@@ -22,6 +22,7 @@ from huggingface_hub import HfApi
 
 # 警告の抑制
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+os.environ["DISABLE_PANDERA_IMPORT_WARNING"] = "True" # Pandera警告抑制
 
 # 1. 検索パスにサブモジュールのルートフォルダを追加
 submodule_root = os.path.abspath(os.path.join(os.path.dirname(__file__), 'edinet_xbrl_prep'))
@@ -144,8 +145,8 @@ def parse_worker(task):
         )
         
         # 数値データとテキストデータの分離
-        qualitative_df = fs_df[fs_df['role_name'].isin(qualitative_roles)].copy()
-        quantitative_df = fs_df[~fs_df['role_name'].isin(qualitative_roles)].copy()
+        qualitative_df = fs_df[fs_df['role'].isin(qualitative_roles)].copy()
+        quantitative_df = fs_df[~fs_df['role'].isin(qualitative_roles)].copy()
         
         # 型変換 (Parquet保存時のエラー回避のため、object型は全てstrにする)
         for df in [qualitative_df, quantitative_df]:
