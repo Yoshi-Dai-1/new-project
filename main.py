@@ -22,7 +22,7 @@ from huggingface_hub import HfApi
 
 # 警告の抑制
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-os.environ["DISABLE_PANDERA_IMPORT_WARNING"] = "True" # Pandera警告抑制
+# os.environ["DISABLE_PANDERA_IMPORT_WARNING"] = "True" # Pandera警告抑制 (ユーザー要望により解除)
 
 # 1. 検索パスにサブモジュールのルートフォルダを追加
 submodule_root = os.path.abspath(os.path.join(os.path.dirname(__file__), 'edinet_xbrl_prep'))
@@ -423,7 +423,7 @@ def main():
         # 1. 数値データ (Financial Values)
         # ==============================
         if all_financial_rows:
-            target_dfs = [df for df in all_financial_rows if df['docID'].iloc[0] in target_docids]
+            target_dfs = [df for df in all_financial_rows if df['docid'].iloc[0] in target_docids]
             
             if target_dfs:
                 merged_quant_df = pd.concat(target_dfs, ignore_index=True)
