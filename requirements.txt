@@ -19,3 +19,4 @@ xlrd>=2.0.1
 python-dotenv
 huggingface_hub
 pyarrow
+multimethod<=1.12
