@@ -1,5 +1,7 @@
 import argparse
+import json
 import os
+import shutil
 import signal
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -19,12 +21,13 @@ from master_merger import MasterMerger
 submodule_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "edinet_xbrl_prep"))
 sys.path.insert(0, submodule_root)
 
-# サブモジュールのインポート (絶対パス設定後に読み込み)
-from edinet_xbrl_prep.extractor import extract_quant_only  # noqa: E402
+# サブモジュールからのインポート (パス設定後に読み込み)
+from edinet_xbrl_prep.fs_tbl import get_fs_tbl  # noqa: E402
 
 # 設定
 DATA_PATH = Path("data")
 RAW_BASE_DIR = DATA_PATH / "raw"
+TEMP_DIR = DATA_PATH / "temp"
 PARALLEL_WORKERS = 4
 BATCH_PARALLEL_SIZE = 8
 
@@ -43,15 +46,33 @@ signal.signal(signal.SIGINT, signal_handler)
 def parse_worker(args):
     """並列実行される解析ワーカー"""
     docid, row_dict, account_list, zip_path = args
+    extract_dir = TEMP_DIR / docid
     try:
-        quant_df = extract_quant_only(str(zip_path), account_list)
-        if quant_df is not None and not quant_df.empty:
-            quant_df["docid"] = docid
-            quant_df["submitDateTime"] = row_dict.get("submitDateTime", "")
-            return docid, quant_df, None
+        # get_fs_tbl を使用して解析 (定量データのみを想定)
+        # サブモジュールの仕様に基づき、適切なロールキーワードを指定
+        roles = ["BS", "PL", "CF", "SS"]
+        df = get_fs_tbl(
+            account_list_common_obj=account_list,
+            docid=docid,
+            zip_file_str=str(zip_path),
+            temp_path_str=str(extract_dir),
+            role_keyward_list=roles,
+        )
+
+        if df is not None and not df.empty:
+            df["docid"] = docid
+            df["submitDateTime"] = row_dict.get("submitDateTime", "")
+            # 型の安定化
+            for col in df.columns:
+                if df[col].dtype == "object":
+                    df[col] = df[col].astype(str)
+            return docid, df, None
         return docid, None, None
     except Exception as e:
         return docid, None, str(e)
+    finally:
+        if extract_dir.exists():
+            shutil.rmtree(extract_dir)
 
 
 def main():
@@ -59,6 +80,7 @@ def main():
     parser.add_argument("--start", type=str, help="YYYY-MM-DD")
     parser.add_argument("--end", type=str, help="YYYY-MM-DD")
     parser.add_argument("--id_list", type=str, help="Comma separated docIDs", default=None)
+    parser.add_argument("--list-only", action="store_true", help="Output metadata as JSON for GHA matrix")
     args = parser.parse_args()
 
     api_key = os.getenv("EDINET_API_KEY")
@@ -80,14 +102,33 @@ def main():
     log_dir.mkdir(exist_ok=True)
     logger.add(log_dir / "pipeline_{time}.log", rotation="10 MB", level="INFO")
 
-    logger.info("=== Data Lakehouse 2.0 実行開始 ===")
-
+    # エンジン初期化
     edinet = EdinetEngine(api_key, DATA_PATH)
     catalog = CatalogManager(hf_repo, hf_token, DATA_PATH)
     merger = MasterMerger(hf_repo, hf_token, DATA_PATH)
     history = HistoryEngine(DATA_PATH)
 
-    # 1. 市場マスタと履歴の更新
+    # 1. メタデータ取得
+    all_meta = edinet.fetch_metadata(args.start, args.end)
+    if not all_meta:
+        if args.list_only:
+            print("JSON_MATRIX_DATA: []")
+        return
+
+    # GHAマトリックス用出力
+    if args.list_only:
+        matrix_data = []
+        for row in all_meta:
+            docid = row["docID"]
+            if catalog.is_processed(docid):
+                continue
+            matrix_data.append({"id": docid, "sector": catalog.get_sector(row.get("secCode", "")[:4])})
+        print(f"JSON_MATRIX_DATA: {json.dumps(matrix_data)}")
+        return
+
+    logger.info("=== Data Lakehouse 2.0 実行開始 ===")
+
+    # 2. 市場マスタと履歴の更新
     if not args.id_list:
         try:
             jpx_master = history.fetch_jpx_master()
@@ -102,18 +143,18 @@ def main():
         except Exception as e:
             logger.error(f"市場履歴更新中にエラーが発生しました: {e}")
 
-    # 2. メタデータ取得
-    all_meta = edinet.fetch_metadata(args.start, args.end)
-    if not all_meta:
-        return
-
+    # 3. 処理対象の選定
     tasks = []
     new_catalog_records = []
     loaded_acc = {}
 
+    target_ids = args.id_list.split(",") if args.id_list else None
+
     for row in all_meta:
         docid = row["docID"]
-        if catalog.is_processed(docid):
+        if target_ids and docid not in target_ids:
+            continue
+        if not target_ids and catalog.is_processed(docid):
             continue
 
         y, m = row["submitDateTime"][:4], row["submitDateTime"][5:7]
@@ -151,12 +192,13 @@ def main():
     if new_catalog_records:
         catalog.update_catalog(new_catalog_records)
 
-    # 3. 解析
+    # 4. 並列解析
     all_quant_dfs = []
     processed_infos = []
 
     if tasks:
         logger.info(f"解析対象: {len(tasks)} 件")
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
         with ProcessPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
             for i in range(0, len(tasks), BATCH_PARALLEL_SIZE):
                 if is_shutting_down:
@@ -176,7 +218,7 @@ def main():
                             {"docID": did, "sector": catalog.get_sector(meta_row.get("secCode", "")[:4])}
                         )
 
-    # 4. マージ
+    # 5. マスターマージ
     if all_quant_dfs:
         logger.info("マスターマージを開始します...")
         full_quant_df = pd.concat(all_quant_dfs, ignore_index=True)
