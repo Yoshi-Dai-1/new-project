@@ -1,0 +1,37 @@
+[project]
+name = "Integrated-Disclosure-Data-Lakehouse"
+version = "2.0.0"
+description = "Comprehensive disclosure data pipeline for Japan market"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pandas",
+    "pyarrow",
+    "huggingface_hub",
+    "requests",
+    "pydantic",
+    "loguru",
+]
+
+[tool.ruff]
+# ルールの設定
+# E: Error, F: Pyflakes, I: isort, B: flake8-bugbear
+select = ["E", "F", "I", "B"]
+ignore = []
+
+# コードの長さ制限
+line-length = 120
+
+# ターゲットのPythonバージョン
+target-version = "py310"
+
+[tool.ruff.format]
+# フォーマット設定
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"

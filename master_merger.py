@@ -1,0 +1,61 @@
+from pathlib import Path
+
+import pandas as pd
+from huggingface_hub import HfApi, hf_hub_download
+from loguru import logger
+
+
+class MasterMerger:
+    def __init__(self, hf_repo: str, hf_token: str, data_path: Path):
+        self.hf_repo = hf_repo
+        self.hf_token = hf_token
+        self.data_path = data_path
+        self.api = HfApi() if hf_repo and hf_token else None
+
+    def merge_and_upload(self, sector: str, master_type: str, new_data: pd.DataFrame):
+        """業種別にParquetをロード・結合・アップロード"""
+        if new_data.empty:
+            return
+
+        safe_sector = str(sector).replace("/", "・").replace("\\", "・")
+        repo_path = f"master/{master_type}/sector={safe_sector}/data.parquet"
+
+        # 1. 既存データのロード
+        try:
+            m_path = hf_hub_download(repo_id=self.hf_repo, filename=repo_path, repo_type="dataset", token=self.hf_token)
+            master_df = pd.read_parquet(m_path)
+            logger.debug(f"既存Master読み込み: {safe_sector} ({len(master_df)} rows)")
+            combined_df = pd.concat([master_df, new_data], ignore_index=True)
+        except Exception:
+            logger.info(f"新規Master作成: {safe_sector} ({master_type})")
+            combined_df = new_data
+
+        # 2. 重複排除 (最新優先)
+        subset = ["docid", "key", "context_ref"] if master_type == "financial_values" else ["docid", "key"]
+
+        if "submitDateTime" in combined_df.columns:
+            combined_df = combined_df.sort_values("submitDateTime", ascending=False)
+
+        combined_df = combined_df.drop_duplicates(subset=subset, keep="first")
+
+        # 3. 保存とアップロード
+        local_file = self.data_path / f"master_{safe_sector}_{master_type}.parquet"
+
+        for col in combined_df.columns:
+            if combined_df[col].dtype == "object":
+                combined_df[col] = combined_df[col].astype(str)
+
+        combined_df.to_parquet(local_file, compression="zstd", index=False)
+
+        if self.api:
+            try:
+                self.api.upload_file(
+                    path_or_fileobj=str(local_file),
+                    path_in_repo=repo_path,
+                    repo_id=self.hf_repo,
+                    repo_type="dataset",
+                    token=self.hf_token,
+                )
+                logger.success(f"Master更新成功: {safe_sector} ({master_type})")
+            except Exception as e:
+                logger.error(f"Masterアップロード失敗: {safe_sector} - {e}")

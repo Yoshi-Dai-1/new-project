@@ -29,6 +29,10 @@ jobs:
           cache: 'pip'
       - name: Install dependencies
         run: pip install -r requirements.txt
+      - name: Lint and Format with Ruff
+        run: |
+          ruff format .
+          ruff check --fix .
       - id: set-matrix
         env:
           EDINET_API_KEY: ${{ secrets.EDINET_API_KEY }}
@@ -130,6 +134,10 @@ jobs:
           cache: 'pip'
       - name: Install dependencies
         run: pip install -r requirements.txt
+      - name: Lint and Format with Ruff
+        run: |
+          ruff format .
+          ruff check --fix .
 
       - name: Run Extraction
         env:
