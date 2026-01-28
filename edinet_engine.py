@@ -94,7 +94,8 @@ class EdinetEngine:
                 with open(save_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=1024 * 64):
                         f.write(chunk)
-                logger.debug(f"DL成功: {doc_id} (type={doc_type})")
+                # ログが多すぎるため、ファイル保存の詳細はトレースレベルに下げる
+                logger.trace(f"DL成功: {doc_id} (type={doc_type})")
                 return True
             else:
                 logger.error(f"DL失敗: {doc_id} (HTTP {r.status_code})")
@@ -106,6 +107,7 @@ class EdinetEngine:
     def get_account_list(self, taxonomy_year: str):
         """解析用タクソノミの取得"""
         try:
+            # ライブラリ内部で パス / "文字列" の連結エラーが出るのを防ぐため str で渡す
             acc = account_list_common(taxonomy_year, str(self.data_path))
             return acc
         except Exception:

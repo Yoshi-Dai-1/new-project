@@ -33,6 +33,13 @@ jobs:
         run: |
           ruff format .
           ruff check --fix .
+      - name: Cache Data Lakehouse Masters
+        uses: actions/cache@v4
+        with:
+          path: data/meta
+          key: ${{ runner.os }}-masters-${{ hashFiles('**/requirements.txt') }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-masters-
       - id: set-matrix
         env:
           EDINET_API_KEY: ${{ secrets.EDINET_API_KEY }}
@@ -140,7 +147,13 @@ jobs:
         run: |
           ruff format .
           ruff check --fix .
-
+      - name: Cache Data Lakehouse Masters
+        uses: actions/cache@v4
+        with:
+          path: data/meta
+          key: ${{ runner.os }}-masters-${{ hashFiles('**/requirements.txt') }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-masters-
       - name: Run Extraction
         env:
           EDINET_API_KEY: ${{ secrets.EDINET_API_KEY }}
@@ -156,5 +169,3 @@ jobs:
           [[ -n "${{ github.event.inputs.end_date }}" ]] && END_DATE="${{ github.event.inputs.end_date }}"
           
           python main.py --start "$START_DATE" --end "$END_DATE" --id-list "${{ matrix.chunk.ids }}"
-
-      # Commit and Push (Parquet化に伴い廃止)
