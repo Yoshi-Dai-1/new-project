@@ -33,6 +33,8 @@ jobs:
         run: |
           ruff format .
           ruff check --fix .
+      - name: Prep and Cache Data Lakehouse Masters
+        run: mkdir -p data/meta
       - name: Cache Data Lakehouse Masters
         uses: actions/cache@v4
         with:
@@ -47,54 +49,55 @@ jobs:
           EXTRACT_END: ${{ github.event.inputs.end_date || '2024-06-30' }}
           DISABLE_PANDERA_IMPORT_WARNING: True
         run: |
-          # 30日前から今日までの期間を自動計算
           START_DATE=$(date -d "30 days ago" +%Y-%m-%d)
           END_DATE=$(date +%Y-%m-%d)
-          
-          # 手動入力がある場合はそちらを優先
           [[ -n "${{ github.event.inputs.start_date }}" ]] && START_DATE="${{ github.event.inputs.start_date }}"
           [[ -n "${{ github.event.inputs.end_date }}" ]] && END_DATE="${{ github.event.inputs.end_date }}"
           
-          # マーカー（JSON_MATRIX_DATA:）を目印に JSON を取得
           RAW_JSON=$(python main.py --list-only --start "$START_DATE" --end "$END_DATE" | grep "^JSON_MATRIX_DATA:" | cut -d':' -f2-)
           DATA=${RAW_JSON:-"[]"}
           
-          # 業種衝突を防ぎつつ均等分割するロジック
           echo "$DATA" | python -c "
           import json, math, sys
           try:
-              # 標準入力から JSON を読み込む
               data_raw = sys.stdin.read()
               data = json.loads(data_raw)
               if not data:
-                  sys.stderr.write('\n' + '#' * 60 + '\n')
-                  sys.stderr.write('  EDINET 抽出レポート: 書類が 0 件のため終了します\n')
-                  sys.stderr.write('#' * 60 + '\n\n')
                   print('matrix=[]')
                   sys.exit(0)
               
+              # 【投資効率化】証券コードがない（非上場企業）をフィルタリング
+              filtered_data = [item for item in data if item.get('sector') != 'その他']
+              
+              if not filtered_data:
+                  sys.stderr.write('上場銘柄の書類が0件でした。非上場を含め全件処理します。\n')
+                  filtered_data = data # 念のため全件に戻す
+              
               sec_map = {}
-              for item in data:
+              for item in filtered_data:
                   s = item['sector']
                   sec_map.setdefault(s, []).append(item['id'])
               
+              # 書き込み競合を避けるため、業種単位でバケットに分ける
+              # 分割数は 10。
               sorted_sectors = sorted(sec_map.keys(), key=lambda x: len(sec_map[x]), reverse=True)
-              n, buckets, bucket_counts = 4, [[] for _ in range(4)], [0] * 4
-              res_meta = [{} for _ in range(4)]
+              n_jobs = 10
+              buckets = [[] for _ in range(n_jobs)]
+              bucket_counts = [0] * n_jobs
+              res_meta = [{} for _ in range(n_jobs)]
               
               for s in sorted_sectors:
+                  # 最も合計件数が少ないジョブに、業種ごとの全書類を割り当てる
                   idx = bucket_counts.index(min(bucket_counts))
                   buckets[idx].extend(sec_map[s])
                   bucket_counts[idx] += len(sec_map[s])
-                  # セクター名をバケットごとに追加記録
                   if 'sectors' not in res_meta[idx]: res_meta[idx]['sectors'] = []
                   res_meta[idx]['sectors'].append(s)
               
               res = []
               for i, b in enumerate(buckets):
                   if not b: continue
-                  sectors_str = \", \".join(res_meta[i]['sectors'])
-                  # 表示用に短縮 (長すぎる場合は末尾を...)
+                  sectors_str = ', '.join(res_meta[i]['sectors'])
                   display_sectors = (sectors_str[:50] + '...') if len(sectors_str) > 50 else sectors_str
                   res.append({
                       'ids': ','.join(b),
@@ -103,17 +106,7 @@ jobs:
                       'sectors': display_sectors
                   })
               
-              # レポート出力
-              sys.stderr.write('\n' + '#' * 60 + '\n')
-              sys.stderr.write('  EDINET 書類取得・ジョブ分割 レポート\n')
-              sys.stderr.write('#' * 60 + '\n')
-              sys.stderr.write(f'対象期間内の書類総数: {len(data)} 件\n')
-              sys.stderr.write(f'分割ジョブ数: {len(res)}\n\n')
-              for r in res:
-                  sys.stderr.write(f'  - Job {r[\"idx\"]}: {r[\"count\"]} 件を担当 ({r[\"sectors\"]})\n')
-              sys.stderr.write('#' * 60 + '\n\n')
-  
-              # 結果をGitHub Outputへ
+              sys.stderr.write(f'対象期間内の上場銘柄書類数: {len(filtered_data)} 件\n')
               print(f'matrix={json.dumps(res)}')
           except Exception as e:
               import traceback
@@ -147,6 +140,8 @@ jobs:
         run: |
           ruff format .
           ruff check --fix .
+      - name: Prep and Cache Data Lakehouse Masters
+        run: mkdir -p data/meta
       - name: Cache Data Lakehouse Masters
         uses: actions/cache@v4
         with:
@@ -160,12 +155,8 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_REPO: ${{ vars.HF_REPO }}
         run: |
-          # 30日前から今日までの期間を自動計算（修復用スライディングウィンドウ）
           START_DATE=$(date -d "30 days ago" +%Y-%m-%d)
           END_DATE=$(date +%Y-%m-%d)
-          
-          # 手動入力がある場合はそちらを優先
           [[ -n "${{ github.event.inputs.start_date }}" ]] && START_DATE="${{ github.event.inputs.start_date }}"
           [[ -n "${{ github.event.inputs.end_date }}" ]] && END_DATE="${{ github.event.inputs.end_date }}"
-          
           python main.py --start "$START_DATE" --end "$END_DATE" --id-list "${{ matrix.chunk.ids }}"

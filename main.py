@@ -8,7 +8,15 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 
+# パス設定をインポートの直前（標準ライブラリの次）に移動
+submodule_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "edinet_xbrl_prep"))
+if submodule_root not in sys.path:
+    sys.path.insert(0, submodule_root)
+
 import pandas as pd
+
+# サブモジュールからのインポート
+from edinet_xbrl_prep.fs_tbl import get_fs_tbl
 from loguru import logger
 
 # モジュールのインポート
@@ -16,13 +24,6 @@ from catalog_manager import CatalogManager
 from edinet_engine import EdinetEngine
 from history_engine import HistoryEngine
 from master_merger import MasterMerger
-
-# サブモジュールのインポート設定
-submodule_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "edinet_xbrl_prep"))
-sys.path.insert(0, submodule_root)
-
-# サブモジュールからのインポート (パス設定後に読み込み)
-from edinet_xbrl_prep.fs_tbl import get_fs_tbl  # noqa: E402
 
 # 設定
 DATA_PATH = Path("data")
@@ -117,14 +118,20 @@ def main():
         except Exception as e:
             logger.error(f"市場履歴更新中にエラーが発生しました: {e}")
 
-    # 2. メタデータ取得
+    # 1. メタデータ取得
     all_meta = edinet.fetch_metadata(args.start, args.end)
     if not all_meta:
         if args.list_only:
             print("JSON_MATRIX_DATA: []")
         return
 
-    # 3. GHAマトリックス用出力
+    # 【投資特化】証券コードがない（非上場企業）を即座に除外
+    initial_count = len(all_meta)
+    all_meta = [row for row in all_meta if row.get("secCode") and len(str(row.get("secCode", "")).strip()) >= 5]
+    if initial_count > len(all_meta):
+        logger.info(f"非上場・投資対象外の書類を {initial_count - len(all_meta)} 件スキップしました。")
+
+    # 2. GHAマトリックス用出力
     if args.list_only:
         matrix_data = []
         for row in all_meta:

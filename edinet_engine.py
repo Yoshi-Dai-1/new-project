@@ -48,7 +48,7 @@ class EdinetEngine:
                 raise KeyError(f"Taxonomy URL not found for year: {year}")
 
             logger.info(f"タクソノミをダウンロード中: {url}")
-            r = requests.get(url, stream=True, verify=False)
+            r = requests.get(url, stream=True)
             with self_alc.taxonomy_file.open(mode="wb") as f:
                 for chunk in r.iter_content(1024):
                     f.write(chunk)
@@ -102,7 +102,7 @@ class EdinetEngine:
         params = {"type": doc_type, "Subscription-Key": self.api_key}
 
         try:
-            r = requests.get(url, params=params, verify=False, timeout=(20, 90), stream=True)
+            r = requests.get(url, params=params, timeout=(20, 90), stream=True)
             if r.status_code == 200:
                 save_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(save_path, "wb") as f:
