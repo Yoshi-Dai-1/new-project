@@ -14,16 +14,22 @@ dependencies = [
 ]
 
 [tool.ruff]
-# ルールの設定
-# E: Error, F: Pyflakes, I: isort, B: flake8-bugbear
+# 除外設定: 外部ライブラリ(サブモジュール)や解析用ノートブックを除外
+exclude = [
+    "edinet_xbrl_prep",
+    "*.ipynb",
+]
+
+# 全般設定
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+# ルールの設定 (E: Error, F: Pyflakes, I: isort, B: flake8-bugbear)
 select = ["E", "F", "I", "B"]
 ignore = []
-
-# コードの長さ制限
-line-length = 120
-
-# ターゲットのPythonバージョン
-target-version = "py310"
+fixable = ["ALL"]
+unfixable = []
 
 [tool.ruff.format]
 # フォーマット設定
