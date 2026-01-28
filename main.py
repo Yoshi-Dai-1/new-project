@@ -18,7 +18,7 @@ from pathlib import Path
 from zipfile import ZipFile
 import pyarrow as pa
 import pyarrow.parquet as pq
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, hf_hub_download
 
 # 警告の抑制
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -144,12 +144,28 @@ def parse_worker(task):
             role_keyward_list=ALL_ROLES
         )
         
-        # 数値データとテキストデータの分離
-        qualitative_df = fs_df[fs_df['role'].isin(qualitative_roles)].copy()
-        quantitative_df = fs_df[~fs_df['role'].isin(qualitative_roles)].copy()
+        # 数値データとテキストデータの分離 (キーワードベースで柔軟に分離)
+        # 財務4表 (BS, PL, CF, SS) に含まれないものは全てテキスト（Qualitative）とみなす
+        quantitative_keywords = FS_DICT['BS'] + FS_DICT['PL'] + FS_DICT['CF'] + FS_DICT['SS']
+        
+        def is_quantitative(r):
+            return any(k in r for k in quantitative_keywords)
+
+        # fs_df['role'] に含まれる各ロールが、財務4表のキーワードを含んでいるか判定
+        fs_df['is_quant'] = fs_df['role'].apply(is_quantitative)
+        
+        qualitative_df = fs_df[~fs_df['is_quant']].copy()
+        quantitative_df = fs_df[fs_df['is_quant']].copy()
+        
+        # 不要な一時カラムを削除
+        qualitative_df.drop(columns=['is_quant'], inplace=True, errors='ignore')
+        quantitative_df.drop(columns=['is_quant'], inplace=True, errors='ignore')
         
         # 型変換 (Parquet保存時のエラー回避のため、object型は全てstrにする)
+        submit_dt = str(row_dict['submitDateTime'])
         for df in [qualitative_df, quantitative_df]:
+            if not df.empty:
+                df['submitDateTime'] = submit_dt
             for col in df.columns:
                 if df[col].dtype == 'object':
                     df[col] = df[col].astype(str)
@@ -203,7 +219,8 @@ def main():
         return
 
     yuho_df = edinet_meta.get_yuho_df()
-    yuho_filtered = yuho_df[yuho_df['docTypeCode'] == '120'].copy()
+    # 120: 有価証券報告書, 130: 訂正有価証券報告書
+    yuho_filtered = yuho_df[yuho_df['docTypeCode'].isin(['120', '130'])].copy()
     
     if yuho_filtered.empty:
         if args.list_only:
@@ -233,7 +250,22 @@ def main():
     
     hf_token = os.getenv("HF_TOKEN")
     hf_repo = os.getenv("HF_REPO") # 例: "user/edinet-data"
+    api = HfApi() if hf_token and hf_repo else None
 
+    # =========================================================
+    # 既読判定 (Registry)
+    # =========================================================
+    registry_df = pd.DataFrame(columns=['docid', 'processed_at'])
+    if api:
+        try:
+            reg_path = hf_hub_download(repo_id=hf_repo, filename="registry.parquet", repo_type="dataset", token=hf_token)
+            registry_df = pd.read_parquet(reg_path)
+            print(f"Registryを読み込みました ({len(registry_df)} 件の既読データ)")
+        except Exception:
+            print("Registryが見つかりません。新規作成します。")
+
+    processed_ids = set(registry_df['docid'])
+    
     # タクソノミURLを外部ファイルから読み込み、ライブラリのハードコード値をオーバーライド
     taxonomy_urls_path = Path("taxonomy_urls.json")
     if taxonomy_urls_path.exists():
@@ -286,6 +318,7 @@ def main():
 
     for docid, row in yuho_filtered.iterrows():
         docid_str = str(docid)
+        submit_date = str(row['submitDateTime']) # "YYYY-MM-DD HH:MM:SS"
         
         # タクソノミ年度の判定 (3月31日ルール)
         period_end = str(row.get('periodEnd', ''))
@@ -321,8 +354,14 @@ def main():
         if not account_list:
             continue
         
+        # 既読チェック
+        if docid_str in processed_ids:
+            print(f"【重複スキップ】書類ID: {docid_str} は既に処理済みのためスキップします。")
+            continue
+            
         # SQLiteチェックを廃止し、全てタスクに追加
-        tasks_to_parse.append((docid_str, row.to_dict()))
+        # account_list を渡す引数として追加
+        tasks_to_parse.append((docid_str, row.to_dict(), account_list))
 
     # 結果集約用コンテナ
     all_financial_rows = []
@@ -375,6 +414,7 @@ def main():
                     if err:
                         print(f"解析エラー ({d_id}): {err}")
                     else:
+                        print(f"【成功】解析完了: {row.get('filerName', 'Unknown')[:15]}... ({d_id})")
                         # 数値データの蓄積
                         if res_quant_df is not None and not res_quant_df.empty:
                             all_financial_rows.append(res_quant_df)
@@ -382,11 +422,23 @@ def main():
                         processed_doc_info.append({
                             "submitYear": row['submitYear'],
                             "sector": row.get('sector_label_33', 'その他'),
-                            "docID": d_id
+                            "docID": d_id,
+                            "submitDateTime": row['submitDateTime']
                         })
                         
-                        # ZIP削除
+                        # 生データ (Raw ZIP) の保存とアップロード
                         z_path = RAW_XBRL_DIR / f"{d_id}.zip"
+                        if z_path.exists() and api:
+                            y = row['submitYear']
+                            m = row['submitDateTime'][5:7]
+                            api.upload_file(
+                                path_or_fileobj=str(z_path),
+                                path_in_repo=f"raw/{y}/{m}/{d_id}.zip",
+                                repo_id=hf_repo,
+                                repo_type="dataset",
+                                token=hf_token
+                            )
+                        
                         if z_path.exists(): os.remove(z_path)
 
                 except Exception as e:
@@ -395,100 +447,120 @@ def main():
     # =========================================================
     # 集約と Parquet 保存・アップロード
     # =========================================================
-    
     if not processed_doc_info:
-        print("処理されたデータはありません。")
+        print("\n[処理完了] 今回新しく処理された書類はありませんでした。")
         return
 
     # DataFrame化
     info_df = pd.DataFrame(processed_doc_info)
-    
     # (年度, 業種) ごとにグループ化
     groups = info_df.groupby(['submitYear', 'sector'])
-    
-    # HfApi インスタンス (トークンがある場合のみ)
-    api = HfApi() if hf_token and hf_repo else None
-    if not api:
-        print("HF_TOKEN または HF_REPO が未設定のため、ローカル保存のみ行います。")
 
-    print("\n[保存処理] Parquetファイルの作成とアップロードを開始します...")
+    print(f"\n[保存処理] {len(processed_doc_info)} 件の新規データを Master Parquet へマージし、Registry を更新します...")
+    
+    new_registry_records = []
     
     for (year, sector), group in groups:
         target_docids = set(group['docID'])
         safe_sector = str(sector).replace("/", "・").replace("\\", "・")
         
-        # ファイル名の定義 (start_date, end_date を含める)
-        file_base_name = f"{year}_{safe_sector}_{args.start.replace('-','')}_{args.end.replace('-','')}"
-        
         # 1. 数値データ (Financial Values)
-        # ==============================
         if all_financial_rows:
             target_dfs = [df for df in all_financial_rows if df['docid'].iloc[0] in target_docids]
-            
             if target_dfs:
-                merged_quant_df = pd.concat(target_dfs, ignore_index=True)
+                new_data = pd.concat(target_dfs, ignore_index=True)
+                for col in new_data.columns:
+                    if new_data[col].dtype == 'object': new_data[col] = new_data[col].astype(str)
                 
-                # 型の調整
-                for col in merged_quant_df.columns:
-                    if merged_quant_df[col].dtype == 'object':
-                        merged_quant_df[col] = merged_quant_df[col].astype(str)
+                # Masterデータの読み込みとマージ (Upsert)
+                master_path_in_repo = f"master/financial_values/sector={safe_sector}/data.parquet"
+                try:
+                    m_path = hf_hub_download(repo_id=hf_repo, filename=master_path_in_repo, repo_type="dataset", token=hf_token)
+                    master_df = pd.read_parquet(m_path)
+                    print(f" -> 既存Master読み込み: {safe_sector} ({len(master_df)} rows)")
+                    # 重複（docid, element_name, context_ref等）を考慮して結合
+                    master_df = pd.concat([master_df, new_data], ignore_index=True)
+                    # 最新の提出日時を優先して重複削除
+                    # docid, key, context_ref が同一なら、submitDateTime が新しい方を残す
+                    master_df = master_df.sort_values('submitDateTime', ascending=False)
+                    master_df = master_df.drop_duplicates(subset=['docid', 'key', 'context_ref'], keep='first')
+                except Exception:
+                    master_df = new_data
                 
-                pq_val_path = DATA_PATH / f"{file_base_name}_values.parquet"
-                table = pa.Table.from_pandas(merged_quant_df)
-                pq.write_table(table, pq_val_path, compression='zstd')
-                print(f"作成: {pq_val_path} ({len(merged_quant_df)} rows)")
+                # ローカル保存
+                pq_master_path = DATA_PATH / f"master_{safe_sector}_values.parquet"
+                master_df.to_parquet(pq_master_path, compression='zstd', index=False)
                 
                 # Upload
                 if api:
-                    print(f" -> Uploading {pq_val_path.name}...")
-                    try:
-                        api.upload_file(
-                            path_or_fileobj=pq_val_path,
-                            path_in_repo=f"data/{year}/{safe_sector}/{pq_val_path.name}",
-                            repo_id=hf_repo,
-                            repo_type="dataset",
-                            token=hf_token
-                        )
-                    except Exception as e:
-                        print(f"Upload Error: {e}")
-                
-        # 2. テキストデータ (Qualitative Text)
-        # ==================================
-        text_dfs = []
-        for d_id in target_docids:
-            p_path = QUALITATIVE_DIR / f"{d_id}.parquet"
-            if p_path.exists():
-                try:
-                    df_text = pd.read_parquet(p_path)
-                    text_dfs.append(df_text)
-                except:
-                    pass
-        
-        if text_dfs:
-            merged_text_df = pd.concat(text_dfs, ignore_index=True)
-            # 型調整
-            for col in merged_text_df.columns:
-                if merged_text_df[col].dtype == 'object':
-                    merged_text_df[col] = merged_text_df[col].astype(str)
-
-            pq_text_path = DATA_PATH / f"{file_base_name}_text.parquet"
-            table = pa.Table.from_pandas(merged_text_df)
-            pq.write_table(table, pq_text_path, compression='zstd')
-            print(f"作成: {pq_text_path} ({len(merged_text_df)} rows)")
-            
-            # Upload
-            if api:
-                print(f" -> Uploading {pq_text_path.name}...")
-                try:
                     api.upload_file(
-                        path_or_fileobj=pq_text_path,
-                        path_in_repo=f"data/{year}/{safe_sector}/{pq_text_path.name}",
+                        path_or_fileobj=str(pq_master_path),
+                        path_in_repo=master_path_in_repo,
                         repo_id=hf_repo,
                         repo_type="dataset",
                         token=hf_token
                     )
-                except Exception as e:
-                    print(f"Upload Error: {e}")
+                    print(f"【Master更新(数値)】{safe_sector} をアップロードしました。")
+
+        # 2. テキストデータ (Qualitative Text)
+        text_dfs = []
+        for d_id in target_docids:
+            p_path = QUALITATIVE_DIR / f"{d_id}.parquet"
+            if p_path.exists():
+                try: text_dfs.append(pd.read_parquet(p_path))
+                except: pass
+        
+        if text_dfs:
+            new_text = pd.concat(text_dfs, ignore_index=True)
+            for col in new_text.columns:
+                if new_text[col].dtype == 'object': new_text[col] = new_text[col].astype(str)
+            
+            master_text_repo = f"master/qualitative_text/sector={safe_sector}/data.parquet"
+            try:
+                mt_path = hf_hub_download(repo_id=hf_repo, filename=master_text_repo, repo_type="dataset", token=hf_token)
+                master_text_df = pd.read_parquet(mt_path)
+                master_text_df = pd.concat([master_text_df, new_text], ignore_index=True)
+                # docid, key が同一なら、submitDateTime が新しい方を残す
+                master_text_df = master_text_df.sort_values('submitDateTime', ascending=False)
+                master_text_df = master_text_df.drop_duplicates(subset=['docid', 'key'], keep='first')
+            except Exception:
+                master_text_df = new_text
+
+            pq_text_master = DATA_PATH / f"master_{safe_sector}_text.parquet"
+            master_text_df.to_parquet(pq_text_master, compression='zstd', index=False)
+            
+            if api:
+                api.upload_file(
+                    path_or_fileobj=str(pq_text_master),
+                    path_in_repo=master_text_repo,
+                    repo_id=hf_repo,
+                    repo_type="dataset",
+                    token=hf_token
+                )
+                print(f"【Master更新(テキスト)】{safe_sector} をアップロードしました。")
+
+        # レジストリ用レコードの作成
+        for d_id in target_docids:
+            new_registry_records.append({'docid': d_id, 'processed_at': datetime.now().isoformat()})
+
+    # =========================================================
+    # Registryの更新とアップロード
+    # =========================================================
+    if new_registry_records:
+        new_reg_df = pd.DataFrame(new_registry_records)
+        updated_registry = pd.concat([registry_df, new_reg_df], ignore_index=True).drop_duplicates(subset=['docid'], keep='last')
+        pq_reg_path = DATA_PATH / "registry.parquet"
+        updated_registry.to_parquet(pq_reg_path, index=False)
+        
+        if api:
+            api.upload_file(
+                path_or_fileobj=str(pq_reg_path),
+                path_in_repo="registry.parquet",
+                repo_id=hf_repo,
+                repo_type="dataset",
+                token=hf_token
+            )
+            print(f"\n【Registry更新】合計 {len(updated_registry)} 件の処理済みインデックスを保存しました。")
 
     # クリーンアップ (一時ファイル)
     if QUALITATIVE_DIR.exists():

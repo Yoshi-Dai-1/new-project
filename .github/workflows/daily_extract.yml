@@ -36,8 +36,16 @@ jobs:
           EXTRACT_END: ${{ github.event.inputs.end_date || '2024-06-30' }}
           DISABLE_PANDERA_IMPORT_WARNING: True
         run: |
+          # 30日前から今日までの期間を自動計算
+          START_DATE=$(date -d "30 days ago" +%Y-%m-%d)
+          END_DATE=$(date +%Y-%m-%d)
+          
+          # 手動入力がある場合はそちらを優先
+          [[ -n "${{ github.event.inputs.start_date }}" ]] && START_DATE="${{ github.event.inputs.start_date }}"
+          [[ -n "${{ github.event.inputs.end_date }}" ]] && END_DATE="${{ github.event.inputs.end_date }}"
+          
           # マーカー（JSON_MATRIX_DATA:）を目印に JSON を取得
-          RAW_JSON=$(python main.py --list-only --start "$EXTRACT_START" --end "$EXTRACT_END" | grep "^JSON_MATRIX_DATA:" | cut -d':' -f2-)
+          RAW_JSON=$(python main.py --list-only --start "$START_DATE" --end "$END_DATE" | grep "^JSON_MATRIX_DATA:" | cut -d':' -f2-)
           DATA=${RAW_JSON:-"[]"}
           
           # 業種衝突を防ぎつつ均等分割するロジック
@@ -59,13 +67,28 @@ jobs:
               
               sorted_sectors = sorted(sec_map.keys(), key=lambda x: len(sec_map[x]), reverse=True)
               n, buckets, bucket_counts = 4, [[] for _ in range(4)], [0] * 4
+              res_meta = [{} for _ in range(4)]
               
               for s in sorted_sectors:
                   idx = bucket_counts.index(min(bucket_counts))
                   buckets[idx].extend(sec_map[s])
                   bucket_counts[idx] += len(sec_map[s])
+                  # セクター名をバケットごとに追加記録
+                  if 'sectors' not in res_meta[idx]: res_meta[idx]['sectors'] = []
+                  res_meta[idx]['sectors'].append(s)
               
-              res = [{'ids': ','.join(b), 'idx': i, 'count': len(b)} for i, b in enumerate(buckets) if b]
+              res = []
+              for i, b in enumerate(buckets):
+                  if not b: continue
+                  sectors_str = \", \".join(res_meta[i]['sectors'])
+                  # 表示用に短縮 (長すぎる場合は末尾を...)
+                  display_sectors = (sectors_str[:50] + '...') if len(sectors_str) > 50 else sectors_str
+                  res.append({
+                      'ids': ','.join(b),
+                      'idx': i,
+                      'count': len(b),
+                      'sectors': display_sectors
+                  })
               
               # レポート出力
               sys.stderr.write('\n' + '#' * 60 + '\n')
@@ -74,13 +97,14 @@ jobs:
               sys.stderr.write(f'対象期間内の書類総数: {len(data)} 件\n')
               sys.stderr.write(f'分割ジョブ数: {len(res)}\n\n')
               for r in res:
-                  sys.stderr.write(f'  - Job {r[\"idx\"]}: {r[\"count\"]} 件を担当\n')
+                  sys.stderr.write(f'  - Job {r[\"idx\"]}: {r[\"count\"]} 件を担当 ({r[\"sectors\"]})\n')
               sys.stderr.write('#' * 60 + '\n\n')
 
               # 結果をGitHub Outputへ
               print(f'matrix={json.dumps(res)}')
           except Exception as e:
-              sys.stderr.write(f'Error: {str(e)}\n')
+              import traceback
+              sys.stderr.write(f'Error: {traceback.format_exc()}\n')
               print('matrix=[]')
           " "$DATA" >> $GITHUB_OUTPUT
 
@@ -95,7 +119,7 @@ jobs:
       matrix:
         chunk: ${{ fromJson(needs.discovery.outputs.matrix) }}
     timeout-minutes: 360
-    
+    name: extract (${{ matrix.chunk.sectors }})
     steps:
       - uses: actions/checkout@v4
         with:
@@ -112,8 +136,15 @@ jobs:
           EDINET_API_KEY: ${{ secrets.EDINET_API_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_REPO: ${{ vars.HF_REPO }}
-          EXTRACT_START: ${{ github.event.inputs.start_date || '2024-06-01' }}
-          EXTRACT_END: ${{ github.event.inputs.end_date || '2024-06-30' }}
-        run: python main.py --start "$EXTRACT_START" --end "$EXTRACT_END" --id-list "${{ matrix.chunk.ids }}"
+        run: |
+          # 30日前から今日までの期間を自動計算（修復用スライディングウィンドウ）
+          START_DATE=$(date -d "30 days ago" +%Y-%m-%d)
+          END_DATE=$(date +%Y-%m-%d)
+          
+          # 手動入力がある場合はそちらを優先
+          [[ -n "${{ github.event.inputs.start_date }}" ]] && START_DATE="${{ github.event.inputs.start_date }}"
+          [[ -n "${{ github.event.inputs.end_date }}" ]] && END_DATE="${{ github.event.inputs.end_date }}"
+          
+          python main.py --start "$START_DATE" --end "$END_DATE" --id-list "${{ matrix.chunk.ids }}"
 
       # Commit and Push (Parquet化に伴い廃止)
