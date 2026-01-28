@@ -53,10 +53,12 @@ jobs:
           DATA=${RAW_JSON:-"[]"}
           
           # 業種衝突を防ぎつつ均等分割するロジック
-          python -c "
+          echo "$DATA" | python -c "
           import json, math, sys
           try:
-              data = json.loads(sys.argv[1])
+              # 標準入力から JSON を読み込む
+              data_raw = sys.stdin.read()
+              data = json.loads(data_raw)
               if not data:
                   sys.stderr.write('\n' + '#' * 60 + '\n')
                   sys.stderr.write('  EDINET 抽出レポート: 書類が 0 件のため終了します\n')
@@ -103,14 +105,14 @@ jobs:
               for r in res:
                   sys.stderr.write(f'  - Job {r[\"idx\"]}: {r[\"count\"]} 件を担当 ({r[\"sectors\"]})\n')
               sys.stderr.write('#' * 60 + '\n\n')
-
+  
               # 結果をGitHub Outputへ
               print(f'matrix={json.dumps(res)}')
           except Exception as e:
               import traceback
               sys.stderr.write(f'Error: {traceback.format_exc()}\n')
               print('matrix=[]')
-          " "$DATA" >> $GITHUB_OUTPUT
+          " >> $GITHUB_OUTPUT
 
   extract:
     needs: discovery
