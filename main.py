@@ -183,6 +183,11 @@ def main():
             if loaded_acc[ty]:
                 tasks.append((docid, row, loaded_acc[ty], raw_zip))
 
+        # 50件ごとに進捗を報告
+        processed_count = len(new_catalog_records)
+        if processed_count % 50 == 0:
+            logger.info(f"ダウンロード進捗: {processed_count} / {len(all_meta)} 件完了")
+
     if new_catalog_records:
         catalog.update_catalog(new_catalog_records)
 
@@ -205,12 +210,17 @@ def main():
                     if err:
                         logger.error(f"解析失敗: {did} - {err}")
                     elif quant_df is not None:
-                        logger.success(f"解析成功: {did}")
                         all_quant_dfs.append(quant_df)
                         meta_row = next(m for m in all_meta if m["docID"] == did)
                         processed_infos.append(
                             {"docID": did, "sector": catalog.get_sector(meta_row.get("secCode", "")[:4])}
                         )
+
+                # 10件（1バブル）ごとに進捗を報告
+                done_count = i + len(batch)
+                logger.info(
+                    f"解析進捗: {min(done_count, len(tasks))} / {len(tasks)} 件完了 (成功累積: {len(all_quant_dfs)})"
+                )
 
     # 6. マスターマージ
     if all_quant_dfs:

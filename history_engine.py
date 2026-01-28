@@ -17,6 +17,7 @@ class HistoryEngine:
         """JPXから最新の銘柄一覧を取得"""
         logger.info("JPX銘柄マスタを取得中...")
         r = requests.get(self.jpx_url, stream=True, verify=False)
+        self.data_path.mkdir(parents=True, exist_ok=True)
         xls_path = self.data_path / "jpx_master.xls"
         with xls_path.open("wb") as f:
             for chunk in r.iter_content(1024):

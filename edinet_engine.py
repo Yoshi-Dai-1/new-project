@@ -108,7 +108,7 @@ class EdinetEngine:
                 with open(save_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=1024 * 64):
                         f.write(chunk)
-                logger.info(f"取得成功: {doc_id} (type={doc_type})")
+                logger.debug(f"取得成功: {doc_id} (type={doc_type})")
                 return True
             else:
                 logger.error(f"DL失敗: {doc_id} (HTTP {r.status_code})")
