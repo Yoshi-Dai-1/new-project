@@ -1,3 +1,4 @@
+import importlib.util
 from pathlib import Path
 from typing import Dict, List
 
@@ -5,13 +6,9 @@ import requests
 from loguru import logger
 
 # サブモジュールからのインポート (正規の階層で指定)
-# 解析エラー回避のため、ここで multimethod の存在を確認
-try:
-    from multimethod import overload as _
-except ImportError:
-    # 万が一古いバージョンが残っている場合に備え、ランタイムで警告を出さない工夫が必要な場合もあるが、
-    # 基本は環境構築で解決すべき。ここではインポートエラーを早期検知する。
-    pass
+# 解析エラー回避のため、ここで multimethod の存在（バージョン整合性）を確認
+if importlib.util.find_spec("multimethod") is None:
+    logger.warning("multimethod が見つかりません。解析エンジンが正常に動作しない可能性があります。")
 
 from edinet_xbrl_prep.edinet_xbrl_prep.edinet_api import edinet_response_metadata, request_term
 from edinet_xbrl_prep.edinet_xbrl_prep.link_base_file_analyzer import account_list_common
