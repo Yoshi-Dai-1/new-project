@@ -13,6 +13,8 @@ class EdinetDocument(BaseModel):
     secCode: Optional[str] = None
     edinetCode: Optional[str] = None
     docTypeCode: Optional[str] = None
+    ordinanceCode: Optional[str] = None
+    formCode: Optional[str] = None
     xbrlFlag: Optional[str] = "0"
     pdfFlag: Optional[str] = "0"
 

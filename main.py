@@ -1,7 +1,6 @@
 import argparse
 import json
 import os
-import shutil
 import signal
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -40,43 +39,31 @@ signal.signal(signal.SIGINT, signal_handler)
 
 
 def parse_worker(args):
-    """並列実行される解析ワーカー"""
-    docid, row_dict, account_list, zip_path = args
+    """並列処理用ワーカー関数"""
+    docid, row, acc_obj, raw_zip, role_kws = args
     extract_dir = TEMP_DIR / docid
     try:
-        roles = ["BS", "PL", "CF", "SS"]
-        logger.debug(f"解析開始: {docid} (Path: {zip_path})")
+        if acc_obj is None:
+            return docid, None, "Account list not loaded"
 
-        # 1. XBRLの抽出とパース状況を確認
-        from edinet_xbrl_prep.edinet_xbrl_prep.xbrl_parser_rapper import get_xbrl_rapper
+        logger.debug(f"解析開始: {docid} (Path: {raw_zip})")
 
-        xbrl_df, log_dict = get_xbrl_rapper(
-            docid=docid, zip_file=str(zip_path), temp_dir=extract_dir, out_path=extract_dir, update_flg=True
-        )
-
-        logger.debug(
-            f"XBRLパース完了: {docid} | Status: {log_dict.get('get_xbrl_status')} | "
-            f"RowCount: {len(xbrl_df) if xbrl_df is not None else 0}"
-        )
-        if log_dict.get("get_xbrl_error_message"):
-            logger.warning(f"XBRLパース警告: {docid} - {log_dict.get('get_xbrl_error_message')}")
-
-        # 2. 財務諸表テーブルの構築
+        # 開発者ブログ推奨の get_fs_tbl を呼び出し
         df = get_fs_tbl(
-            account_list_common_obj=account_list,
+            account_list_common_obj=acc_obj,
             docid=docid,
-            zip_file_str=str(zip_path),
+            zip_file_str=str(raw_zip),
             temp_path_str=str(extract_dir),
-            role_keyward_list=roles,
+            role_keyward_list=role_kws,
         )
 
         if df is not None and not df.empty:
             df["docid"] = docid
-            df["submitDateTime"] = row_dict.get("submitDateTime", "")
+            df["submitDateTime"] = row.get("submitDateTime", "")
             for col in df.columns:
                 if df[col].dtype == "object":
                     df[col] = df[col].astype(str)
-            logger.debug(f"解析成功: {docid} | 構造化データ: {len(df)} 件")
+            logger.debug(f"解析成功: {docid} | 抽出レコード数: {len(df)}")
             return docid, df, None
 
         msg = "No objects to concatenate" if (df is None or df.empty) else "Empty Results"
@@ -90,6 +77,8 @@ def parse_worker(args):
         return docid, None, f"{str(e)}"
     finally:
         if extract_dir.exists():
+            import shutil
+
             shutil.rmtree(extract_dir)
 
 
@@ -202,11 +191,23 @@ def main():
     # 【カタログ整合性】ダウンロード直後ではなく、解析結果に基づき登録するよう設計変更
     potential_catalog_records = {}  # docid -> record_base
     loaded_acc = {}
+    skipped_types = {}  # 新たに追加
 
     target_ids = args.id_list.split(",") if args.id_list else None
 
     # 解析タスクの追加 (XBRL がある Yuho/Shihanki のみ)
-    skipped_types = {}
+    # 解析対象選定用のキーワード (開発者ブログより)
+    fs_dict = {
+        "BS": ["_BalanceSheet", "_ConsolidatedBalanceSheet"],
+        "PL": ["_StatementOfIncome", "_ConsolidatedStatementOfIncome"],
+        "CF": ["_StatementOfCashFlows", "_ConsolidatedStatementOfCashFlows"],
+        "SS": ["_StatementOfChangesInEquity", "_ConsolidatedStatementOfChangesInEquity"],
+        "notes": ["_Notes", "_ConsolidatedNotes"],
+        "report": ["_CabinetOfficeOrdinanceOnDisclosure"],
+    }
+    # 有報解析で使用する標準キーワードセット
+    standard_role_kws = fs_dict["BS"] + fs_dict["PL"] + fs_dict["report"]
+
     for row in all_meta:
         docid = row["docID"]
         title = row.get("docDescription", "名称不明")
@@ -261,19 +262,22 @@ def main():
         }
         potential_catalog_records[docid] = record
 
-        # 解析タスクの判定 (有価証券報告書 120 のみ)
+        # 解析タスクの判定 (有価証券報告書 120 + 府令 010 + 様式 030000)
         dtc = row.get("docTypeCode")
-        is_yuho = dtc == "120"
+        ord_c = row.get("ordinanceCode")
+        form_c = row.get("formCode")
+        # 開発者ブログの指定: 種別=120, 政令=010, 様式=030000
+        is_yuho = dtc == "120" and ord_c == "010" and form_c == "030000"
 
         if is_yuho and zip_ok:
             ty = row["submitDateTime"][:4]
             if ty not in loaded_acc:
                 loaded_acc[ty] = edinet.get_account_list(ty)
             if loaded_acc[ty]:
-                tasks.append((docid, row, loaded_acc[ty], raw_zip))
+                tasks.append((docid, row, loaded_acc[ty], raw_zip, standard_role_kws))
                 logger.info(f"【解析対象】: {docid} | {title} | {status_str}")
         else:
-            reason = "解析対象外種別" if dtc != "120" else "XBRLなし"
+            reason = "非解析対象（有報以外）" if not is_yuho else "XBRLなし"
             logger.info(f"【スキップ】: {docid} | {title} | {status_str} | 理由: {reason}")
             skipped_types[dtc] = skipped_types.get(dtc, 0) + 1
             # 解析対象外でもファイルがあればカタログに積む
