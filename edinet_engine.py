@@ -1,18 +1,13 @@
-import importlib.util
 from pathlib import Path
 from typing import Dict, List
 
 import requests
 from loguru import logger
 
-# サブモジュールからのインポート (正規の階層で指定)
-# 解析エラー回避のため、ここで multimethod の存在（バージョン整合性）を確認
-if importlib.util.find_spec("multimethod") is None:
-    logger.warning("multimethod が見つかりません。解析エンジンが正常に動作しない可能性があります。")
-
+# 内部モジュール（外部ライブラリ）のインポート
 from edinet_xbrl_prep.edinet_xbrl_prep.edinet_api import edinet_response_metadata, request_term
 from edinet_xbrl_prep.edinet_xbrl_prep.link_base_file_analyzer import account_list_common
-from models import EdinetDocument  # noqa: E402
+from models import EdinetDocument
 
 
 class EdinetEngine:
@@ -25,47 +20,6 @@ class EdinetEngine:
 
     def _apply_monkypatches(self):
         """ライブラリのバグや制約を修正するためのパッチ適用"""
-        engine_self = self
-
-        def patched_download_taxonomy(self_alc):
-            # (中略: 既存のパッチ内容)
-            year = getattr(self_alc, "account_list_year", None)
-            url = engine_self.taxonomy_urls.get(year)
-            if not url:
-                link_dict = {
-                    "2024": "https://www.fsa.go.jp/search/20231211/1c_Taxonomy.zip",
-                    "2023": "https://www.fsa.go.jp/search/20221108/1c_Taxonomy.zip",
-                    "2022": "https://www.fsa.go.jp/search/20211109/1c_Taxonomy.zip",
-                    "2021": "https://www.fsa.go.jp/search/20201110/1c_Taxonomy.zip",
-                    "2020": "https://www.fsa.go.jp/search/20191101/1c_Taxonomy.zip",
-                }
-                url = link_dict.get(year)
-
-            if not url:
-                logger.error(f"タクソノミURLが見つかりません (年: {year})")
-                raise KeyError(f"Taxonomy URL not found for year: {year}")
-
-            logger.info(f"タクソノミをダウンロード中: {url}")
-            r = requests.get(url, stream=True)
-            with self_alc.taxonomy_file.open(mode="wb") as f:
-                for chunk in r.iter_content(1024):
-                    f.write(chunk)
-
-        def patched_alc_init(self_alc, account_list_year, data_path):
-            """
-            TypeError: unsupported operand type(s) for /: 'str' and 'str'
-            を解決するための初期化パッチ。data_path を確実に Path オブジェクトにする。
-            """
-            self_alc.account_list_year = account_list_year
-            # ここが修正の核心: data_path を Path オブジェクトに変換して保持する
-            dp = Path(data_path)
-            self_alc.data_path = dp
-            self_alc.taxonomy_file = dp / "taxonomy_{}.zip".format(account_list_year)
-            self_alc.taxonomy_path = dp / "taxonomy_{}".format(account_list_year)
-            self_alc.log_dict = {}
-
-        account_list_common.__init__ = patched_alc_init
-        account_list_common._download_taxonomy = patched_download_taxonomy
 
         # サブモジュール内の verify=False を物理的に無効化する
         import edinet_xbrl_prep.edinet_xbrl_prep.edinet_api as edinet_api_mod
@@ -134,8 +88,8 @@ class EdinetEngine:
     def get_account_list(self, taxonomy_year: str):
         """解析用タクソノミの取得"""
         try:
-            # ライブラリ内部で パス / "文字列" の連結エラーが出るのを防ぐため str で渡す
-            acc = account_list_common(taxonomy_year, str(self.data_path))
+            # ライブラリ内部に直接 Path を渡す（ユーザーの指摘通り、初期状態で動作していたはずの実装に戻す）
+            acc = account_list_common(str(self.data_path), taxonomy_year)
             return acc
         except Exception:
             logger.exception(f"タクソノミ取得エラー (Year: {taxonomy_year})")

@@ -88,7 +88,8 @@ jobs:
               
               # 書き込み競合回避のため、業種単位でバケットに分ける
               sorted_sectors = sorted(sec_map.keys(), key=lambda x: len(sec_map[x]), reverse=True)
-              n_jobs = 10
+              # ARG_MAX 回避のため、ジョブの分割数を増やし、1つの引数が長くなりすぎないように調整
+              n_jobs = 20  # 分割数を2倍に増加
               buckets = [[] for _ in range(n_jobs)]
               bucket_counts = [0] * n_jobs
               res_meta = [{} for _ in range(n_jobs)]
@@ -105,6 +106,10 @@ jobs:
                   if not b: continue
                   sectors_str = ', '.join(res_meta[i]['sectors'])
                   display_sectors = (sectors_str[:50] + '...') if len(sectors_str) > 50 else sectors_str
+                  
+                  # 1つの引数に渡すIDが多すぎる場合、さらにサブ分割することも検討可能だが、
+                  # まずは分割数を増やして対応。各IDは約12文字(S+11桁)。
+                  # 1ジョブあたり200件程度なら2.4KBとなり、ARG_MAX(通常128KB以上)には十分収まる。
                   res.append({
                       'ids': ','.join(b),
                       'idx': i,
@@ -163,5 +168,5 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_REPO: ${{ vars.HF_REPO }}
         run: |
-          # discoveryジョブと同じ日付を使用
-          python main.py --start "${{ needs.discovery.outputs.start_date }}" --end "${{ needs.discovery.outputs.end_date }}" --id-list "${{ matrix.chunk.ids }}"
+          # main.py の引数名は --id_list
+          python main.py --start "${{ needs.discovery.outputs.start_date }}" --end "${{ needs.discovery.outputs.end_date }}" --id_list "${{ matrix.chunk.ids }}"

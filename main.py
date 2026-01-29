@@ -8,7 +8,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
-import urllib3
 from loguru import logger
 
 # モジュールのインポート
@@ -139,17 +138,6 @@ def main():
         return
 
     logger.info("=== Data Lakehouse 2.0 実行開始 ===")
-
-    # 1. 警告抑制と環境チェック (関数内で実行することで E402 警告を回避)
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    try:
-        import multimethod
-
-        v = [int(x) for x in multimethod.__version__.split(".")]
-        if v[0] < 1 or (v[0] == 1 and v[1] < 10):
-            logger.warning(f"multimethod バージョン不一致の恐れ: {multimethod.__version__}")
-    except Exception:
-        pass
 
     # 4. 処理対象の選定
     tasks = []
