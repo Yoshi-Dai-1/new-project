@@ -45,6 +45,22 @@ def parse_worker(args):
     extract_dir = TEMP_DIR / docid
     try:
         roles = ["BS", "PL", "CF", "SS"]
+        logger.debug(f"解析開始: {docid} (Path: {zip_path})")
+
+        # 1. XBRLの抽出とパース状況を確認
+        from edinet_xbrl_prep.edinet_xbrl_prep.xbrl_parser_rapper import get_xbrl_rapper
+
+        xbrl_df, log_dict = get_xbrl_rapper(
+            docid=docid, zip_file=str(zip_path), temp_dir=extract_dir, out_path=extract_dir, update_flg=True
+        )
+
+        logger.debug(
+            f"XBRLパース完了: {docid} | Status: {log_dict.get('get_xbrl_status')} | RowCount: {len(xbrl_df) if xbrl_df is not None else 0}"
+        )
+        if log_dict.get("get_xbrl_error_message"):
+            logger.warning(f"XBRLパース警告: {docid} - {log_dict.get('get_xbrl_error_message')}")
+
+        # 2. 財務諸表テーブルの構築
         df = get_fs_tbl(
             account_list_common_obj=account_list,
             docid=docid,
@@ -59,10 +75,18 @@ def parse_worker(args):
             for col in df.columns:
                 if df[col].dtype == "object":
                     df[col] = df[col].astype(str)
+            logger.debug(f"解析成功: {docid} | 構造化データ: {len(df)} 件")
             return docid, df, None
-        return docid, None, None
+
+        msg = "No objects to concatenate" if (df is None or df.empty) else "Empty Results"
+        return docid, None, msg
+
     except Exception as e:
-        return docid, None, str(e)
+        import traceback
+
+        err_detail = traceback.format_exc()
+        logger.error(f"解析例外: {docid}\n{err_detail}")
+        return docid, None, f"{str(e)}"
     finally:
         if extract_dir.exists():
             shutil.rmtree(extract_dir)
@@ -184,6 +208,8 @@ def main():
     skipped_types = {}
     for row in all_meta:
         docid = row["docID"]
+        title = row.get("docDescription", "名称不明")
+
         if target_ids and docid not in target_ids:
             continue
         if not target_ids and catalog.is_processed(docid):
@@ -191,12 +217,32 @@ def main():
 
         y, m = row["submitDateTime"][:4], row["submitDateTime"][5:7]
         raw_dir = RAW_BASE_DIR / "edinet" / y / m
+        raw_dir.mkdir(parents=True, exist_ok=True)
         raw_zip = raw_dir / f"{docid}.zip"
         raw_pdf = raw_dir / f"{docid}.pdf"
 
-        # ダウンロード実行 (解析不要な書類もダウンロードは行う)
-        zip_ok = edinet.download_doc(docid, raw_zip, 1) if row.get("xbrlFlag") == "1" else False
-        pdf_ok = edinet.download_doc(docid, raw_pdf, 2) if row.get("pdfFlag") == "1" else False
+        # ダウンロード実行 (フラグに基づき正確に試行)
+        has_xbrl = row.get("xbrlFlag") == "1"
+        has_pdf = row.get("pdfFlag") == "1"
+
+        zip_ok = False
+        if has_xbrl:
+            zip_ok = edinet.download_doc(docid, raw_zip, 1)
+            if not zip_ok:
+                logger.error(f"XBRLダウンロード失敗: {docid} | {title}")
+
+        pdf_ok = False
+        if has_pdf:
+            pdf_ok = edinet.download_doc(docid, raw_pdf, 2)
+            if not pdf_ok:
+                logger.error(f"PDFダウンロード失敗: {docid} | {title}")
+
+        file_status = []
+        if has_xbrl:
+            file_status.append("XBRLあり" if zip_ok else "XBRL(DL失敗)")
+        if has_pdf:
+            file_status.append("PDFあり" if pdf_ok else "PDF(DL失敗)")
+        status_str = " + ".join(file_status) if file_status else "ファイルなし"
 
         # カタログ情報のベースを保持
         record = {
@@ -206,31 +252,30 @@ def main():
             "edinet_code": row.get("edinetCode", ""),
             "company_name": row.get("filerName", "Unknown"),
             "doc_type": row.get("docTypeCode", ""),
-            "title": row.get("docDescription", ""),
+            "title": title,
             "submit_at": row.get("submitDateTime", ""),
             "raw_zip_path": f"raw/edinet/{y}/{m}/{docid}.zip" if zip_ok else "",
             "pdf_path": f"raw/edinet/{y}/{m}/{docid}.pdf" if pdf_ok else "",
-            "processed_status": "success",
+            "processed_status": "success" if (zip_ok or pdf_ok) else "failure",
         }
         potential_catalog_records[docid] = record
 
-        # 解析タスクの判定
-        # 120: 有価証券報告書, 121: 訂正有価証券報告書
+        # 解析タスクの判定 (有価証券報告書 120 のみ)
         dtc = row.get("docTypeCode")
-        title = row.get("docDescription", "名称不明")
+        is_yuho = dtc == "120"
 
-        if dtc in ["120", "121"] and zip_ok:
+        if is_yuho and zip_ok:
             ty = row["submitDateTime"][:4]
             if ty not in loaded_acc:
                 loaded_acc[ty] = edinet.get_account_list(ty)
             if loaded_acc[ty]:
                 tasks.append((docid, row, loaded_acc[ty], raw_zip))
-                logger.info(f"【解析対象】: {docid} | {title}")
+                logger.info(f"【解析対象】: {docid} | {title} | {status_str}")
         else:
-            reason = "XBRLなし" if not zip_ok else f"対象外種別({dtc})"
-            logger.info(f"【スキップ】: {docid} | {title} | 理由: {reason}")
+            reason = "解析対象外種別" if dtc != "120" else "XBRLなし"
+            logger.info(f"【スキップ】: {docid} | {title} | {status_str} | 理由: {reason}")
             skipped_types[dtc] = skipped_types.get(dtc, 0) + 1
-            # 解析対象外（臨時報告書など）も正常に処理されたものとしてカタログに積む
+            # 解析対象外でもファイルがあればカタログに積む
             new_catalog_records.append(record)
 
         # 50件ごとに進捗を報告
@@ -238,21 +283,26 @@ def main():
         if not args.id_list and processed_count % 50 == 0:
             logger.info(f"ダウンロード進捗: {processed_count} / {len(all_meta)} 件完了")
 
-    # 解析対象外の書類をこのタイミングで一度カタログ保存
+    # 解析対象外の書類（PDFのみ、種別違い等）をこのタイミングで一度カタログ保存
     if new_catalog_records:
-        logger.info(f"解析不要な書類 {len(new_catalog_records)} 件をカタログに登録します。")
+        logger.info(f"解析対象外の書類 {len(new_catalog_records)} 件をカタログに登録します。")
         catalog.update_catalog(new_catalog_records)
         new_catalog_records = []
 
     if skipped_types:
-        logger.info(f"解析スキップ内訳 (Yuho/Shihanki以外): {skipped_types}")
+        logger.info(f"解析スキップ内訳 (Yuho以外): {skipped_types}")
 
     # 5. 並列解析
     all_quant_dfs = []
     processed_infos = []
 
     if tasks:
-        logger.info(f"解析対象: {len(tasks)} 件")
+        logger.info(f"解析対象: {len(tasks)} 件 (有価証券報告書)")
+        # 解析スキップの内訳に有報(120)などが混ざっていないか、最終確認用ログ
+        check_yuho_in_skip = [k for k in skipped_types.keys() if k in ["120", "121"]]
+        if check_yuho_in_skip:
+            logger.warning(f"注意: 解析対象であるはずの種別がスキップされています: {check_yuho_in_skip}")
+
         TEMP_DIR.mkdir(parents=True, exist_ok=True)
         with ProcessPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
             for i in range(0, len(tasks), BATCH_PARALLEL_SIZE):
@@ -264,28 +314,37 @@ def main():
                 for f in as_completed(futures):
                     did, quant_df, err = f.result()
                     if err:
-                        logger.error(f"解析失敗: {did} - {err}")
-                        # 失敗した書類はカタログに登録しない
+                        logger.error(f"解析失敗: {did} - 理由: {err}")
+                        # 万が一の解析失敗時も、ダウンロード自体は成功しているためカタログには「解析失敗」として残すか検討が必要
+                        # ここでは、整合性のために potential_catalog_records から記録を取得してカタログ登録に回す
+                        if did in potential_catalog_records:
+                            rec = potential_catalog_records[did]
+                            rec["processed_status"] = f"failed: {err}"
+                            new_catalog_records.append(rec)
                     elif quant_df is not None:
                         all_quant_dfs.append(quant_df)
                         meta_row = next(m for m in all_meta if m["docID"] == did)
                         processed_infos.append(
                             {"docID": did, "sector": catalog.get_sector(meta_row.get("secCode", "")[:4])}
                         )
-                        # 【カタログ整合性】解析成功後のタイミングで記録を追加
+                        # 解析成功時のカタログ記録は、マスターマージ成功後に確定させるため、ここでは deferred とする
+                    else:
+                        # 解析対象だがデータが取得できなかった場合
                         if did in potential_catalog_records:
-                            new_catalog_records.append(potential_catalog_records[did])
+                            rec = potential_catalog_records[did]
+                            rec["processed_status"] = "no_data"
+                            new_catalog_records.append(rec)
 
-                # バッチごとにカタログを逐次更新（長時間実行時の安全のため）
+                # バッチごとに登録可能な未定記録を登録
                 if new_catalog_records:
                     catalog.update_catalog(new_catalog_records)
                     new_catalog_records = []
 
-                # 10件（1バブル）ごとに進捗を報告
                 done_count = i + len(batch)
                 logger.info(
-                    f"解析進捗: {min(done_count, len(tasks))} / {len(tasks)} 件完了 (成功累積: {len(all_quant_dfs)})"
+                    f"解析進捗: {min(done_count, len(tasks))} / {len(tasks)} 件完了 (抽出成功累積: {len(all_quant_dfs)})"
                 )
+    new_catalog_records = []
 
     # 6. マスターマージ & カタログ確定
     if all_quant_dfs:
