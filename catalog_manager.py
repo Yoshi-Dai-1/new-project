@@ -47,7 +47,7 @@ class CatalogManager:
                 cols = list(StockMasterRecord.model_fields.keys())
                 return pd.DataFrame(columns=cols)
             elif key == "listing":
-                return pd.DataFrame(columns=["code", "type", "event_date", "note"])
+                return pd.DataFrame(columns=["code", "type", "event_date"])
             elif key == "index":
                 return pd.DataFrame(columns=["index_name", "code", "type", "event_date"])
             elif key == "name":
