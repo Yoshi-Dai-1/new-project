@@ -88,8 +88,13 @@ class EdinetEngine:
     def get_account_list(self, taxonomy_year: str):
         """解析用タクソノミの取得"""
         try:
-            # ライブラリ内部に直接 Path を渡す（ユーザーの指摘通り、初期状態で動作していたはずの実装に戻す）
-            acc = account_list_common(str(self.data_path), taxonomy_year)
+            # 原因追跡のため、渡される引数の型をログに出力
+            logger.debug(
+                f"タクソノミ取得試行: data_path={self.data_path} (type: {type(self.data_path)}), year={taxonomy_year}"
+            )
+
+            # ライブラリ内部で / 演算子が使用されているため、Path オブジェクトをそのまま渡す
+            acc = account_list_common(self.data_path, taxonomy_year)
             return acc
         except Exception:
             logger.exception(f"タクソノミ取得エラー (Year: {taxonomy_year})")
