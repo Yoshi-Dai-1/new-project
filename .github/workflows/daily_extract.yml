@@ -19,6 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
+      start_date: ${{ steps.set-dates.outputs.start_date }}
+      end_date: ${{ steps.set-dates.outputs.end_date }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,7 +30,10 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install --upgrade multimethod  # 解析エラーの根本解決のため明示的に最新化
       - name: Lint and Format with Ruff
         run: |
           ruff format .
@@ -42,19 +47,22 @@ jobs:
           key: ${{ runner.os }}-masters-${{ hashFiles('**/requirements.txt') }}-${{ github.run_id }}
           restore-keys: |
             ${{ runner.os }}-masters-
-      - id: set-matrix
-        env:
-          EDINET_API_KEY: ${{ secrets.EDINET_API_KEY }}
-          EXTRACT_START: ${{ github.event.inputs.start_date || '2024-06-01' }}
-          EXTRACT_END: ${{ github.event.inputs.end_date || '2024-06-30' }}
-          DISABLE_PANDERA_IMPORT_WARNING: True
+      - id: set-dates
         run: |
           START_DATE=$(date -d "30 days ago" +%Y-%m-%d)
           END_DATE=$(date +%Y-%m-%d)
           [[ -n "${{ github.event.inputs.start_date }}" ]] && START_DATE="${{ github.event.inputs.start_date }}"
           [[ -n "${{ github.event.inputs.end_date }}" ]] && END_DATE="${{ github.event.inputs.end_date }}"
-          
-          RAW_JSON=$(python main.py --list-only --start "$START_DATE" --end "$END_DATE" | grep "^JSON_MATRIX_DATA:" | cut -d':' -f2-)
+          echo "start_date=$START_DATE" >> $GITHUB_OUTPUT
+          echo "end_date=$END_DATE" >> $GITHUB_OUTPUT
+      - id: set-matrix
+        env:
+          EDINET_API_KEY: ${{ secrets.EDINET_API_KEY }}
+          EXTRACT_START: ${{ steps.set-dates.outputs.start_date }}
+          EXTRACT_END: ${{ steps.set-dates.outputs.end_date }}
+          DISABLE_PANDERA_IMPORT_WARNING: True
+        run: |
+          RAW_JSON=$(python main.py --list-only --start "${{ steps.set-dates.outputs.start_date }}" --end "${{ steps.set-dates.outputs.end_date }}" | grep "^JSON_MATRIX_DATA:" | cut -d':' -f2-)
           DATA=${RAW_JSON:-"[]"}
           
           echo "$DATA" | python -c "
@@ -66,20 +74,20 @@ jobs:
                   print('matrix=[]')
                   sys.exit(0)
               
-              # 【投資効率化】証券コードがない（非上場企業）をフィルタリング
+              # 証券コードがある書類のみを対象に設定
               filtered_data = [item for item in data if item.get('sector') != 'その他']
               
               if not filtered_data:
-                  sys.stderr.write('上場銘柄の書類が0件でした。非上場を含め全件処理します。\n')
-                  filtered_data = data # 念のため全件に戻す
+                  sys.stderr.write('上場銘柄の書類が0件でした。\n')
+                  print('matrix=[]')
+                  sys.exit(0)
               
               sec_map = {}
               for item in filtered_data:
                   s = item['sector']
                   sec_map.setdefault(s, []).append(item['id'])
               
-              # 書き込み競合を避けるため、業種単位でバケットに分ける
-              # 分割数は 10。
+              # 書き込み競合回避のため、業種単位でバケットに分ける
               sorted_sectors = sorted(sec_map.keys(), key=lambda x: len(sec_map[x]), reverse=True)
               n_jobs = 10
               buckets = [[] for _ in range(n_jobs)]
@@ -87,7 +95,6 @@ jobs:
               res_meta = [{} for _ in range(n_jobs)]
               
               for s in sorted_sectors:
-                  # 最も合計件数が少ないジョブに、業種ごとの全書類を割り当てる
                   idx = bucket_counts.index(min(bucket_counts))
                   buckets[idx].extend(sec_map[s])
                   bucket_counts[idx] += len(sec_map[s])
@@ -135,7 +142,10 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install --upgrade multimethod
       - name: Lint and Format with Ruff
         run: |
           ruff format .
@@ -155,8 +165,5 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_REPO: ${{ vars.HF_REPO }}
         run: |
-          START_DATE=$(date -d "30 days ago" +%Y-%m-%d)
-          END_DATE=$(date +%Y-%m-%d)
-          [[ -n "${{ github.event.inputs.start_date }}" ]] && START_DATE="${{ github.event.inputs.start_date }}"
-          [[ -n "${{ github.event.inputs.end_date }}" ]] && END_DATE="${{ github.event.inputs.end_date }}"
-          python main.py --start "$START_DATE" --end "$END_DATE" --id-list "${{ matrix.chunk.ids }}"
+          # discoveryジョブと同じ日付を使用
+          python main.py --start "${{ needs.discovery.outputs.start_date }}" --end "${{ needs.discovery.outputs.end_date }}" --id-list "${{ matrix.chunk.ids }}"

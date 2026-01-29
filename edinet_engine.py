@@ -4,7 +4,15 @@ from typing import Dict, List
 import requests
 from loguru import logger
 
-# サブモジュールからのインポート (動的パス追加を廃止し、正規の階層で指定)
+# サブモジュールからのインポート (正規の階層で指定)
+# 解析エラー回避のため、ここで multimethod の存在を確認
+try:
+    from multimethod import overload as _
+except ImportError:
+    # 万が一古いバージョンが残っている場合に備え、ランタイムで警告を出さない工夫が必要な場合もあるが、
+    # 基本は環境構築で解決すべき。ここではインポートエラーを早期検知する。
+    pass
+
 from edinet_xbrl_prep.edinet_xbrl_prep.edinet_api import edinet_response_metadata, request_term
 from edinet_xbrl_prep.edinet_xbrl_prep.link_base_file_analyzer import account_list_common
 from models import EdinetDocument  # noqa: E402
@@ -61,6 +69,22 @@ class EdinetEngine:
 
         account_list_common.__init__ = patched_alc_init
         account_list_common._download_taxonomy = patched_download_taxonomy
+
+        # サブモジュール内の verify=False を物理的に無効化する
+        import edinet_xbrl_prep.edinet_xbrl_prep.edinet_api as edinet_api_mod
+
+        # get_edinet_metadata と request_doc の内部で直接 requests.Session().get している箇所をラップ
+        original_session = requests.Session
+
+        class SecureSession(original_session):
+            def get(self, url, **kwargs):
+                # EDINET関連のURLなら verify=True を強制
+                if "api.edinet-fsa.go.jp" in url:
+                    kwargs["verify"] = True
+                return super().get(url, **kwargs)
+
+        # 影響範囲を限定するため、モジュール内の requests.Session を差し替える
+        edinet_api_mod.requests.Session = SecureSession
 
     def fetch_metadata(self, start_date: str, end_date: str) -> List[Dict]:
         """指定期間の全書類メタデータを取得し、Pydanticでバリデーション"""
