@@ -1,9 +1,11 @@
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 
 import pandas as pd
 from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub.utils import HfHubHTTPError
 from loguru import logger
 
 from models import CatalogRecord, StockMasterRecord
@@ -92,19 +94,31 @@ class CatalogManager:
         df.to_parquet(local_file, index=False, compression="zstd")
 
         if self.api:
-            try:
-                self.api.upload_file(
-                    path_or_fileobj=str(local_file),
-                    path_in_repo=filename,
-                    repo_id=self.hf_repo,
-                    repo_type="dataset",
-                    token=self.hf_token,
-                )
-                logger.success(f"アップロード成功: {filename}")
-                return True
-            except Exception as e:
-                logger.error(f"アップロード失敗: {filename} - {e}")
-                return False
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    self.api.upload_file(
+                        path_or_fileobj=str(local_file),
+                        path_in_repo=filename,
+                        repo_id=self.hf_repo,
+                        repo_type="dataset",
+                        token=self.hf_token,
+                    )
+                    logger.success(f"アップロード成功: {filename}")
+                    return True
+                except Exception as e:
+                    # HfHubHTTPErrorの型チェックを行い、429の場合のみリトライ
+                    if isinstance(e, HfHubHTTPError) and e.response.status_code == 429:
+                        wait_time = int(e.response.headers.get("Retry-After", 60)) + 5
+                        logger.warning(
+                            f"Rate limit exceeded. Waiting {wait_time}s before retry ({attempt + 1}/{max_retries})..."
+                        )
+                        time.sleep(wait_time)
+                        continue
+
+                    logger.error(f"アップロード失敗: {filename} - {e}")
+                    return False
+            return False
         return True
 
     def upload_raw(self, local_path: Path, repo_path: str) -> bool:
@@ -114,19 +128,30 @@ class CatalogManager:
             return False
 
         if self.api:
-            try:
-                self.api.upload_file(
-                    path_or_fileobj=str(local_path),
-                    path_in_repo=repo_path,
-                    repo_id=self.hf_repo,
-                    repo_type="dataset",
-                    token=self.hf_token,
-                )
-                logger.debug(f"RAWアップロード成功: {repo_path}")
-                return True
-            except Exception as e:
-                logger.error(f"RAWアップロード失敗: {repo_path} - {e}")
-                return False
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    self.api.upload_file(
+                        path_or_fileobj=str(local_path),
+                        path_in_repo=repo_path,
+                        repo_id=self.hf_repo,
+                        repo_type="dataset",
+                        token=self.hf_token,
+                    )
+                    logger.debug(f"RAWアップロード成功: {repo_path}")
+                    return True
+                except Exception as e:
+                    if isinstance(e, HfHubHTTPError) and e.response.status_code == 429:
+                        wait_time = int(e.response.headers.get("Retry-After", 60)) + 5
+                        logger.warning(
+                            f"Rate limit exceeded for RAW. Waiting {wait_time}s before retry ({attempt + 1}/{max_retries})..."
+                        )
+                        time.sleep(wait_time)
+                        continue
+
+                    logger.error(f"RAWアップロード失敗: {repo_path} - {e}")
+                    return False
+            return False
         return True
 
     def update_listing_history(self, new_events: pd.DataFrame) -> bool:

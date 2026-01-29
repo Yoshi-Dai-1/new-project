@@ -1,7 +1,9 @@
+import time
 from pathlib import Path
 
 import pandas as pd
 from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub.utils import HfHubHTTPError
 from loguru import logger
 
 
@@ -48,17 +50,28 @@ class MasterMerger:
         combined_df.to_parquet(local_file, compression="zstd", index=False)
 
         if self.api:
-            try:
-                self.api.upload_file(
-                    path_or_fileobj=str(local_file),
-                    path_in_repo=repo_path,
-                    repo_id=self.hf_repo,
-                    repo_type="dataset",
-                    token=self.hf_token,
-                )
-                logger.success(f"Master更新成功: {safe_sector} ({master_type})")
-                return True
-            except Exception as e:
-                logger.error(f"Masterアップロード失敗: {safe_sector} - {e}")
-                return False
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    self.api.upload_file(
+                        path_or_fileobj=str(local_file),
+                        path_in_repo=repo_path,
+                        repo_id=self.hf_repo,
+                        repo_type="dataset",
+                        token=self.hf_token,
+                    )
+                    logger.success(f"Master更新成功: {safe_sector} ({master_type})")
+                    return True
+                except Exception as e:
+                    if isinstance(e, HfHubHTTPError) and e.response.status_code == 429:
+                        wait_time = int(e.response.headers.get("Retry-After", 60)) + 5
+                        logger.warning(
+                            f"Master Rate limit exceeded. Waiting {wait_time}s before retry ({attempt + 1}/{max_retries})..."
+                        )
+                        time.sleep(wait_time)
+                        continue
+
+                    logger.error(f"Masterアップロード失敗: {safe_sector} - {e}")
+                    return False
+            return False
         return True

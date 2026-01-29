@@ -41,7 +41,8 @@ signal.signal(signal.SIGINT, signal_handler)
 def parse_worker(args):
     """並列処理用ワーカー関数"""
     docid, row, acc_obj, raw_zip, role_kws, task_type = args
-    extract_dir = TEMP_DIR / docid
+    # 【修正】タスクタイプごとに個別の作業ディレクトリを作成し、競合（Race Condition）を回避
+    extract_dir = TEMP_DIR / f"{docid}_{task_type}"
     try:
         if acc_obj is None:
             return docid, None, "Account list not loaded"
