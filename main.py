@@ -131,18 +131,25 @@ def main():
             old_listing = catalog.get_listing_history()
             listing_events = history.generate_listing_events(catalog.master_df, jpx_master, old_listing)
 
-            # カタログ内の master_df を最新化
-            catalog.update_stocks_master(jpx_master)
-            catalog.update_listing_history(listing_events)
+            # 【修正】全てのMeta/Master更新の成功を確認
+            master_ok = catalog.update_stocks_master(jpx_master)
+            listing_ok = catalog.update_listing_history(listing_events)
 
             nk_list = history.fetch_nikkei_225_events()
             old_index = catalog.get_index_history()
             index_events = history.generate_index_events("Nikkei225", pd.DataFrame(), nk_list, old_index)
-            catalog.update_index_history(index_events)
+            index_ok = catalog.update_index_history(index_events)
 
-            logger.info("市場マスタ・履歴の更新が完了しました。")
+            # 【修正】1つでも失敗したら処理を中断
+            if not (master_ok and listing_ok and index_ok):
+                logger.error("❌ Meta/Master更新に失敗しました。処理を中断します。")
+                logger.error(f"Master: {master_ok}, Listing: {listing_ok}, Index: {index_ok}")
+                return
+
+            logger.info("✅ 市場マスタ・履歴の更新が完了しました。")
     except Exception as e:
-        logger.error(f"市場履歴更新中にエラーが発生しました: {e}")
+        logger.error(f"❌ 市場履歴更新中にエラーが発生しました: {e}")
+        return  # Meta/Master更新失敗時は処理を中断
 
     # 1. メタデータ取得
     all_meta = edinet.fetch_metadata(args.start, args.end)
@@ -313,25 +320,26 @@ def main():
             # ここでは RAW_BASE_DIR (data/raw) 全体を raw/ としてアップロードするのが最も単純
             try:
                 logger.info(f"バッチアップロード開始 (Chunk: {processed_count})")
-                # 【重要】アップロード成功時のみカタログを更新する (失敗時は次回実行時に再処理させるため)
-                if catalog.upload_raw_folder(RAW_BASE_DIR, path_in_repo="raw"):
-                    if new_catalog_records:
-                        catalog.update_catalog(new_catalog_records)
-                        # カタログ登録成功後にリストをクリア
+
+                # 【修正】RAWアップロード成功を確認
+                raw_upload_ok = catalog.upload_raw_folder(RAW_BASE_DIR, path_in_repo="raw")
+
+                if raw_upload_ok and new_catalog_records:
+                    # 【修正】カタログアップロード成功も確認
+                    catalog_update_ok = catalog.update_catalog(new_catalog_records)
+
+                    if catalog_update_ok:
+                        logger.success(f"✅ バッチ処理完了: RAW + カタログ更新成功 ({len(new_catalog_records)} 件)")
                         new_catalog_records = []
-                else:
-                    logger.warning(
-                        "バッチアップロードに失敗したため、カタログ更新をスキップしました (次回再処理されます)"
-                    )
-                    # new_catalog_records は保持したままだと次のバッチで重複する可能性があるが、
-                    # 現在のループ設計では new_catalog_records は累積されず、ここでクリアしないと
-                    # 次の50件と混ざってしまう。
-                    # しかし「失敗した分」はカタログに載せたくないので、リストからは捨てるのが正しい。
-                    # (カタログに載らなければ次回 is_processed=False になり再取得されるため)
+                    else:
+                        logger.error("❌ カタログ更新失敗（次回再処理されます）")
+                        new_catalog_records = []  # 失敗分は破棄
+                elif not raw_upload_ok:
+                    logger.warning("❌ RAWアップロード失敗（次回再処理されます）")
                     new_catalog_records = []
 
             except Exception as e:
-                logger.error(f"バッチアップロード失敗: {e}")
+                logger.error(f"❌ バッチアップロード失敗: {e}")
                 # 例外時も同様にリストを破棄して次回再処理に回す
                 new_catalog_records = []
 
@@ -344,9 +352,10 @@ def main():
     if catalog.upload_raw_folder(RAW_BASE_DIR, path_in_repo="raw"):
         if new_catalog_records:
             logger.info(f"残りの書類 {len(new_catalog_records)} 件をカタログに登録します。")
-            catalog.update_catalog(new_catalog_records)
+            if not catalog.update_catalog(new_catalog_records):  # 【修正】戻り値チェック追加
+                logger.error("❌ 最終カタログ更新に失敗しました（次回再処理されます）")
     else:
-        logger.error("最終アップロードに失敗したため、残りのカタログ更新をスキップしました。")
+        logger.error("❌ 最終アップロードに失敗したため、残りのカタログ更新をスキップしました。")
 
     if skipped_types:
         logger.info(f"解析スキップ内訳 (Yuho以外): {skipped_types}")
@@ -403,7 +412,8 @@ def main():
 
                 # バッチごとに登録可能な未定記録を登録
                 if new_catalog_records:
-                    catalog.update_catalog(new_catalog_records)
+                    if not catalog.update_catalog(new_catalog_records):  # 【修正】戻り値チェック追加
+                        logger.error("❌ 解析中のカタログ更新に失敗しました")
                     new_catalog_records = []
 
                 done_count = i + len(batch)
@@ -428,6 +438,7 @@ def main():
             sec_quant = full_quant_df[full_quant_df["docid"].isin(sec_docids)]
             if not merger.merge_and_upload(sector, "financial_values", sec_quant):
                 all_success = False
+                logger.error(f"❌ Master更新失敗: {sector} (financial_values)")  # 【修正】詳細ログ追加
 
     if all_text_dfs:
         logger.info("テキストデータ(qualitative_text)のマージを開始します...")
@@ -437,6 +448,11 @@ def main():
             sec_text = full_text_df[full_text_df["docid"].isin(sec_docids)]
             if not merger.merge_and_upload(sector, "qualitative_text", sec_text):
                 all_success = False
+                logger.error(f"❌ Master更新失敗: {sector} (qualitative_text)")  # 【修正】詳細ログ追加
+
+    # 【修正】all_success が False の場合の処理を追加
+    if not all_success:
+        logger.warning("⚠️ 一部のMaster更新に失敗しました。次回実行時に再試行されます。")
 
     # カタログ更新（全データ処理後）
     # アップロードに成功したdocid (Quant/Text問わず、何らかのデータが保存できたもの)
