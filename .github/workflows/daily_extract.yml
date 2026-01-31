@@ -57,6 +57,8 @@ jobs:
       - id: set-matrix
         env:
           EDINET_API_KEY: ${{ secrets.EDINET_API_KEY }}
+          HF_REPO: ${{ vars.HF_REPO }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
           EXTRACT_START: ${{ steps.set-dates.outputs.start_date }}
           EXTRACT_END: ${{ steps.set-dates.outputs.end_date }}
           DISABLE_PANDERA_IMPORT_WARNING: True
