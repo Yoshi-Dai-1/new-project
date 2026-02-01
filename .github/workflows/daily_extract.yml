@@ -169,4 +169,38 @@ jobs:
           HF_REPO: ${{ vars.HF_REPO }}
         run: |
           # main.py の引数名は --id_list
-          python main.py --start "${{ needs.discovery.outputs.start_date }}" --end "${{ needs.discovery.outputs.end_date }}" --id_list "${{ matrix.chunk.ids }}"
+          # Worker Mode: Run ID と Chunk ID を指定してデルタファイルを作成
+          python main.py \
+            --start "${{ needs.discovery.outputs.start_date }}" \
+            --end "${{ needs.discovery.outputs.end_date }}" \
+            --id_list "${{ matrix.chunk.ids }}" \
+            --mode worker \
+            --run-id "${{ github.run_id }}" \
+            --chunk-id "${{ matrix.chunk.idx }}"
+
+  finalize:
+    needs: extract
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run Finalize (Merger)
+        env:
+          EDINET_API_KEY: ${{ secrets.EDINET_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ vars.HF_REPO }}
+        run: |
+          # Merger Mode: 全デルタを集約・マージしてGlobal更新
+          python main.py --mode merger --run-id "${{ github.run_id }}"

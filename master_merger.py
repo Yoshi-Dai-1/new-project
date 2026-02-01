@@ -14,12 +14,41 @@ class MasterMerger:
         self.data_path = data_path
         self.api = HfApi() if hf_repo and hf_token else None
 
-    def merge_and_upload(self, sector: str, master_type: str, new_data: pd.DataFrame) -> bool:
+    def merge_and_upload(
+        self,
+        sector: str,
+        master_type: str,
+        new_data: pd.DataFrame,
+        worker_mode: bool = False,
+        catalog_manager=None,
+        run_id: str = None,
+        chunk_id: str = None,
+    ) -> bool:
         """業種別にParquetをロード・結合・アップロード"""
         if new_data.empty:
             return True
 
         safe_sector = str(sector).replace("/", "・").replace("\\", "・")
+
+        # 【修正】Workerモードならデルタ保存のみ行う
+        if worker_mode:
+            if not catalog_manager or not run_id or not chunk_id:
+                logger.error("Worker mode requires catalog_manager, run_id, and chunk_id")
+                return False
+
+            filename = f"{master_type}_{safe_sector}.parquet"
+            # keyはダミーだが、save_delta側でpathsキーチェックに使われる可能性があるため
+            # 存在しないキーだとエラーになるかも?
+            # catalog_manager.save_delta の実装を見ると:
+            # if custom_filename: filename = custom_filename
+            # else: filename = paths[key]...
+            # なので、custom_filenameがあれば paths[key] はアクセスされない。
+            # ただし、念のため "master" を渡しておく。
+
+            return catalog_manager.save_delta(
+                key="master", df=new_data, run_id=run_id, chunk_id=chunk_id, custom_filename=filename
+            )
+
         repo_path = f"master/{master_type}/sector={safe_sector}/data.parquet"
 
         # 1. 既存データのロード

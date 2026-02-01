@@ -83,6 +83,97 @@ def parse_worker(args):
             shutil.rmtree(extract_dir)
 
 
+def run_merger(catalog, merger, run_id):
+    """Mergerモード: デルタファイルの集約とGlobal更新 (Master First 戦略)"""
+    logger.info(f"=== Merger Process Started (Run ID: {run_id}) ===")
+
+    # 1. ハウスキーピング (古いデルタの削除 - 常に実行してOK)
+    catalog.cleanup_deltas(run_id, cleanup_old=True)
+
+    # 2. 有効なデルタの収集
+    deltas = catalog.load_deltas(run_id)
+    if not deltas:
+        logger.warning("有効なデルタデータが見つかりませんでした (No valid chunks found).")
+        # データがない場合はクリーンアップして終了（何も更新していないので安全）
+        catalog.cleanup_deltas(run_id, cleanup_old=False)
+        return
+
+    # 3. マージとGlobal更新 (Strategy: Master/Data First -> Catalog Last)
+    # これにより、Catalogが進んでMasterが更新されない（データロスト）を防ぐ。
+
+    all_masters_success = True
+
+    # --- A. Stock Master ---
+    if "master" in deltas and not deltas["master"].empty:
+        new_master = deltas["master"]
+        merged_master = pd.concat([catalog.master_df, new_master], ignore_index=True).drop_duplicates(
+            subset=["code"], keep="last"
+        )
+        if catalog._save_and_upload("master", merged_master):
+            logger.success("Global Stock Master Updated")
+        else:
+            logger.error("❌ Failed to update Global Stock Master")
+            all_masters_success = False
+
+    # --- B. History (listing, index, name) ---
+    for key in ["listing", "index", "name"]:
+        if key in deltas and not deltas[key].empty:
+            new_hist = deltas[key]
+            current_hist = catalog._load_parquet(key)
+            merged_hist = pd.concat([current_hist, new_hist], ignore_index=True).drop_duplicates()
+            if catalog._save_and_upload(key, merged_hist):
+                logger.success(f"Global {key} History Updated")
+            else:
+                logger.error(f"❌ Failed to update Global {key} History")
+                all_masters_success = False
+
+    # --- C. Financial / Text (Sector based) ---
+    for key, sector_df in deltas.items():
+        if key.startswith("financial_") or key.startswith("text_"):
+            if sector_df.empty:
+                continue
+
+            # キーからセクター名復元
+            sector = key.replace("financial_", "").replace("text_", "")
+            m_type = "financial_values" if key.startswith("financial_") else "qualitative_text"
+
+            # MasterMerger (Standard Mode) でアップロード
+            if not merger.merge_and_upload(sector, m_type, sector_df, worker_mode=False):
+                logger.error(f"❌ Failed to update {m_type} for sector {sector}")
+                all_masters_success = False
+
+    # --- D. Catalog Update (Commit Log) ---
+    # Master系の更新が全て成功した場合のみ、Catalogを更新する
+    catalog_updated = False
+    if all_masters_success:
+        if "catalog" in deltas and not deltas["catalog"].empty:
+            new_df = deltas["catalog"]
+            merged_catalog = pd.concat([catalog.catalog_df, new_df], ignore_index=True).drop_duplicates(
+                subset=["doc_id"], keep="last"
+            )
+            if catalog._save_and_upload("catalog", merged_catalog):
+                logger.success(f"Global Catalog Updated (Total: {len(merged_catalog)} rows)")
+                catalog_updated = True
+            else:
+                logger.error("❌ Failed to update Global Catalog (Data was updated but commit log failed)")
+                # ここでの失敗は「データはあるがカタログにない」状態。
+                # リトライで重複排除されるため、データロストよりはマシ。
+        else:
+            catalog_updated = True  # Catalog自体の更新がない場合は成功とみなす
+    else:
+        logger.error("⛔ Master更新に失敗があるため、Catalog更新をスキップしました (データ整合性保護)")
+
+    # 4. クリーンアップ (条件付き)
+    # 全て正常に完了した場合のみ、今回のデルタを削除する
+    # 失敗した場合はデルタを残し、トラブルシューティングや（将来的な）自動リトライの余地を残す
+    if all_masters_success and catalog_updated:
+        catalog.cleanup_deltas(run_id, cleanup_old=False)
+        logger.info("=== Merger Process Completed Successfully ===")
+    else:
+        logger.warning("⚠️ 一部の処理に失敗したため、Deltaファイルを保持しました。")
+        logger.info("=== Merger Process Completed with Errors ===")
+
+
 def main():
     # 原因追跡のため、受け取った生の引数をログに出力（デバッグ用）
     logger.debug(f"起動引数: {sys.argv}")
@@ -94,6 +185,13 @@ def main():
     parser.add_argument("--id-list", "--id_list", type=str, dest="id_list", help="Comma separated docIDs", default=None)
     parser.add_argument("--list-only", action="store_true", help="Output metadata as JSON for GHA matrix")
 
+    # 【追加】Worker/Mergerモード制御用
+    parser.add_argument("--mode", type=str, default="worker", choices=["worker", "merger"], help="Execution mode")
+    parser.add_argument("--run-id", type=str, dest="run_id", help="Execution ID for delta isolation")
+    parser.add_argument(
+        "--chunk-id", type=str, dest="chunk_id", default="default", help="Chunk ID for parallel workers"
+    )
+
     try:
         args = parser.parse_args()
     except SystemExit as e:
@@ -104,6 +202,10 @@ def main():
     api_key = os.getenv("EDINET_API_KEY")
     hf_token = os.getenv("HF_TOKEN")
     hf_repo = os.getenv("HF_REPO")
+
+    # 実行IDの自動生成 (指定がない場合)
+    run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+    chunk_id = args.chunk_id
 
     if not api_key:
         logger.critical("EDINET_API_KEY が設定されていません。")
@@ -123,33 +225,41 @@ def main():
     merger = MasterMerger(hf_repo, hf_token, DATA_PATH)
     history = HistoryEngine(DATA_PATH)
 
-    # 1. 市場マスタと履歴の更新 (常時実行: 履歴の断絶を防ぐため)
+    # 【追加】Mergerモード分岐
+    if args.mode == "merger":
+        run_merger(catalog, merger, run_id)
+        return
+
+    # Workerモード（以下、既存ロジックだがDelta保存に変更）
+
+    # 1. 市場マスタと履歴の更新 (Worker: Delta保存)
     try:
         jpx_master = history.fetch_jpx_master()
         if not jpx_master.empty:
-            # 過去の履歴を取得して再上場判定に使用
+            # 過去の履歴を取得して再上場判定に使用（参照のみなのでOK）
             old_listing = catalog.get_listing_history()
             listing_events = history.generate_listing_events(catalog.master_df, jpx_master, old_listing)
-
-            # 【修正】全てのMeta/Master更新の成功を確認
-            master_ok = catalog.update_stocks_master(jpx_master)
-            listing_ok = catalog.update_listing_history(listing_events)
 
             nk_list = history.fetch_nikkei_225_events()
             old_index = catalog.get_index_history()
             index_events = history.generate_index_events("Nikkei225", pd.DataFrame(), nk_list, old_index)
-            index_ok = catalog.update_index_history(index_events)
 
-            # 【修正】1つでも失敗したら処理を中断
-            if not (master_ok and listing_ok and index_ok):
-                logger.error("❌ Meta/Master更新に失敗しました。処理を中断します。")
-                logger.error(f"Master: {master_ok}, Listing: {listing_ok}, Index: {index_ok}")
+            # 【修正】Workerモード: Delta保存
+            # 失敗したら即終了してリトライさせる
+            if not catalog.save_delta("master", jpx_master, run_id, chunk_id):
+                logger.error("❌ Master Delta保存失敗")
+                return
+            if not catalog.save_delta("listing", listing_events, run_id, chunk_id):
+                logger.error("❌ Listing History Delta保存失敗")
+                return
+            if not catalog.save_delta("index", index_events, run_id, chunk_id):
+                logger.error("❌ Index History Delta保存失敗")
                 return
 
-            logger.info("✅ 市場マスタ・履歴の更新が完了しました。")
+            logger.info("✅ 市場マスタ・履歴のDelta保存完了")
     except Exception as e:
-        logger.error(f"❌ 市場履歴更新中にエラーが発生しました: {e}")
-        return  # Meta/Master更新失敗時は処理を中断
+        logger.error(f"❌ 市場履歴更新処理中にエラーが発生しました: {e}")
+        return
 
     # 1. メタデータ取得
     all_meta = edinet.fetch_metadata(args.start, args.end)
@@ -201,9 +311,15 @@ def main():
 
     # 4. 処理対象の選定
     tasks = []
-    new_catalog_records = []
+    new_catalog_records = []  # バッチ保存用（解析対象外のみ）
     # 【カタログ整合性】ダウンロード直後ではなく、解析結果に基づき登録するよう設計変更
-    potential_catalog_records = {}  # docid -> record_base
+    potential_catalog_records = {}  # docid -> record_base (全レコード保持)
+    parsing_target_ids = set()  # 解析対象のdocidセット
+
+    # 【RAW整合性】バッチアップロード失敗を追跡するセット
+    upload_failed_docids = set()
+    current_batch_docids = []
+
     loaded_acc = {}
     skipped_types = {}  # 新たに追加
 
@@ -301,13 +417,17 @@ def main():
                 # テキストデータのタスク
                 tasks.append((docid, row, loaded_acc[ty], raw_zip, text_roles, "qualitative_text"))
 
+                parsing_target_ids.add(docid)  # 解析対象としてマーク
                 logger.info(f"【解析対象】: {docid} | {title} | {status_str}")
         else:
             reason = "非解析対象（有報以外）" if not is_yuho else "XBRLなし"
             logger.info(f"【スキップ】: {docid} | {title} | {status_str} | 理由: {reason}")
             skipped_types[dtc] = skipped_types.get(dtc, 0) + 1
-            # 解析対象外でもファイルがあればカタログに積む
+            # 解析対象外は、RAWファイルの存在のみでCatalog登録OKなので、ここに追加
             new_catalog_records.append(record)
+
+        # バッチ管理用にIDを追加
+        current_batch_docids.append(docid)
 
         # 50件ごとに進捗を報告
         processed_count = len(potential_catalog_records)
@@ -324,18 +444,26 @@ def main():
                 # 【修正】RAWアップロード成功を確認
                 raw_upload_ok = catalog.upload_raw_folder(RAW_BASE_DIR, path_in_repo="raw")
 
-                if raw_upload_ok and new_catalog_records:
-                    # 【修正】カタログアップロード成功も確認
-                    catalog_update_ok = catalog.update_catalog(new_catalog_records)
+                if raw_upload_ok:
+                    current_batch_docids = []  # 成功したらクリア
 
-                    if catalog_update_ok:
-                        logger.success(f"✅ バッチ処理完了: RAW + カタログ更新成功 ({len(new_catalog_records)} 件)")
-                        new_catalog_records = []
-                    else:
-                        logger.error("❌ カタログ更新失敗（次回再処理されます）")
-                        new_catalog_records = []  # 失敗分は破棄
-                elif not raw_upload_ok:
-                    logger.warning("❌ RAWアップロード失敗（次回再処理されます）")
+                    if new_catalog_records:
+                        # 【修正】Workerモード: Catalog Delta保存
+                        df_cat = pd.DataFrame(new_catalog_records)
+
+                        if catalog.save_delta("catalog", df_cat, run_id, chunk_id):
+                            logger.success(
+                                f"✅ バッチ処理完了: RAW + Catalog Delta保存 (解析対象外: {len(new_catalog_records)} 件)"
+                            )
+                            new_catalog_records = []
+                        else:
+                            logger.error("❌ Catalog Delta保存失敗（次回再処理されます）")
+                            new_catalog_records = []  # 失敗分は破棄
+                else:
+                    # RAWアップロード失敗
+                    logger.warning(f"❌ RAWアップロード失敗: {len(current_batch_docids)} 件の整合性が損なわれました")
+                    upload_failed_docids.update(current_batch_docids)
+                    current_batch_docids = []  # 記録したのでクリア
                     new_catalog_records = []
 
             except Exception as e:
@@ -349,13 +477,18 @@ def main():
 
     # 最終的な一括アップロード（残り分）
     logger.info("最終バッチアップロードを開始します...")
-    if catalog.upload_raw_folder(RAW_BASE_DIR, path_in_repo="raw"):
+    final_upload_ok = catalog.upload_raw_folder(RAW_BASE_DIR, path_in_repo="raw")
+
+    if final_upload_ok:
         if new_catalog_records:
-            logger.info(f"残りの書類 {len(new_catalog_records)} 件をカタログに登録します。")
-            if not catalog.update_catalog(new_catalog_records):  # 【修正】戻り値チェック追加
-                logger.error("❌ 最終カタログ更新に失敗しました（次回再処理されます）")
+            logger.info(f"残りの書類 {len(new_catalog_records)} 件をDelta保存します。")
+            df_cat = pd.DataFrame(new_catalog_records)
+            if not catalog.save_delta("catalog", df_cat, run_id, chunk_id):
+                logger.error("❌ 最終Catalog Delta保存に失敗しました（次回再処理されます）")
     else:
         logger.error("❌ 最終アップロードに失敗したため、残りのカタログ更新をスキップしました。")
+        # 最終バッチに含まれていたID失敗リストに追加
+        upload_failed_docids.update(current_batch_docids)
 
     if skipped_types:
         logger.info(f"解析スキップ内訳 (Yuho以外): {skipped_types}")
@@ -389,12 +522,14 @@ def main():
                         # ここでは一律ログ出力。ただしCatalogへの記録は "どちらも失敗" の場合のみ考慮が必要だが
                         # 現状はシンプルにエラーログのみ。
                         # "No objects to concatenate" は正常な空振りの可能性が高い。
-                        level = logger.warning if "No objects" in err else logger.error
-                        level(f"解析結果({t_type}): {did} - {err}")
 
-                        # データなしフラグの処理は構造上複雑になるため、
-                        # 「ダウンロード成功ならカタログにはsuccessとして残る」という現状を維持。
-                        # 解析の成否は master データへの結合有無で決まる。
+                        logger.error(f"解析結果({t_type}): {did} - {err}")
+
+                        # 【修正】解析失敗時、カタログ上のステータスを failure に変更
+                        # potential_catalog_records は全レコードを持っている
+                        if did in potential_catalog_records:
+                            potential_catalog_records[did]["processed_status"] = "failure"
+                            logger.warning(f"⚠️ Catalog Status Updated to FAILURE: {did}")
 
                     elif res_df is not None:
                         if t_type == "financial_values":
@@ -411,10 +546,8 @@ def main():
                         )
 
                 # バッチごとに登録可能な未定記録を登録
-                if new_catalog_records:
-                    if not catalog.update_catalog(new_catalog_records):  # 【修正】戻り値チェック追加
-                        logger.error("❌ 解析中のカタログ更新に失敗しました")
-                    new_catalog_records = []
+                # 解析対象のカタログ登録は最後にまとめて行うため、ここでは何もしない
+                pass
 
                 done_count = i + len(batch)
                 logger.info(
@@ -436,9 +569,18 @@ def main():
         for sector in sectors:
             sec_docids = info_df[info_df["sector"] == sector]["docID"].tolist()
             sec_quant = full_quant_df[full_quant_df["docid"].isin(sec_docids)]
-            if not merger.merge_and_upload(sector, "financial_values", sec_quant):
+            # 【修正】Master更新はWorkerモード(Delta)で実行
+            if not merger.merge_and_upload(
+                sector,
+                "financial_values",
+                sec_quant,
+                worker_mode=True,
+                catalog_manager=catalog,
+                run_id=run_id,
+                chunk_id=chunk_id,
+            ):
                 all_success = False
-                logger.error(f"❌ Master更新失敗: {sector} (financial_values)")  # 【修正】詳細ログ追加
+                logger.error(f"❌ Master更新失敗: {sector} (financial_values)")
 
     if all_text_dfs:
         logger.info("テキストデータ(qualitative_text)のマージを開始します...")
@@ -446,9 +588,38 @@ def main():
         for sector in sectors:
             sec_docids = info_df[info_df["sector"] == sector]["docID"].tolist()
             sec_text = full_text_df[full_text_df["docid"].isin(sec_docids)]
-            if not merger.merge_and_upload(sector, "qualitative_text", sec_text):
+            if not merger.merge_and_upload(
+                sector,
+                "qualitative_text",
+                sec_text,
+                worker_mode=True,
+                catalog_manager=catalog,
+                run_id=run_id,
+                chunk_id=chunk_id,
+            ):
                 all_success = False
-                logger.error(f"❌ Master更新失敗: {sector} (qualitative_text)")  # 【修正】詳細ログ追加
+                logger.error(f"❌ Master更新失敗: {sector} (qualitative_text)")
+
+    # 【追加】解析対象ドキュメントのCatalog Delta保存 (解析結果反映後)
+    parsing_catalog_records = []
+    for docid in parsing_target_ids:
+        if docid in potential_catalog_records:
+            rec = potential_catalog_records[docid]
+
+            # 【整合性チェック】RAWアップロード失敗時は強制的にFailure
+            if docid in upload_failed_docids:
+                rec["processed_status"] = "failure"
+                # すでにfailureの場合はそのまま。successだった場合のみ上書きされる。
+                # ログを出すと大量になる可能性があるため、代表的なものだけにするか、ここではサイレントに修正。
+
+            parsing_catalog_records.append(rec)
+
+    if parsing_catalog_records:
+        logger.info(f"解析対象書類のCatalog Deltaを保存します ({len(parsing_catalog_records)} 件)")
+        df_cat = pd.DataFrame(parsing_catalog_records)
+        if not catalog.save_delta("catalog", df_cat, run_id, chunk_id):
+            logger.error("❌ 解析対象Catalog Delta保存に失敗しました")
+            all_success = False
 
     # 【修正】all_success が False の場合の処理を追加
     if not all_success:
@@ -466,7 +637,12 @@ def main():
         pass
 
     if all_success:
-        logger.success("=== パイプライン完了 (正常終了) ===")
+        # 【追加】全成功時、Successフラグを作成
+        if catalog.mark_chunk_success(run_id, chunk_id):
+            logger.success(f"=== Worker完了: Success Flag Created ({run_id}/{chunk_id}) ===")
+        else:
+            logger.error("❌ Success Flag Creation Failed (Job will be treated as failure)")
+            sys.exit(1)
     else:
         logger.error("=== パイプライン完了 (一部のアップロードに失敗しました) ===")
         sys.exit(1)
